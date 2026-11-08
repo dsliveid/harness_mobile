@@ -1,0 +1,21 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  errors:
+    # 禁止在生产代码里留 print：调试用 debugPrint 或 logger
+    avoid_print: error
+    # 协议层必须显式类型，防止 dynamic 穿透
+    inference_failure_on_untyped_parameter: error
+
+linter:
+  rules:
+    - always_declare_return_types
+    - avoid_print
+    - prefer_const_constructors
+    - prefer_final_locals
+    - unawaited_futures
+    - use_super_parameters

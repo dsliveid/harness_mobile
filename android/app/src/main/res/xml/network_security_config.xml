@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 网络安全配置（自用场景）
+
+  背景：
+  - Android 9（API 28）起默认禁止明文 HTTP（cleartextTrafficPermitted 默认 false）
+  - 而本 App 的 baseUrl 归一化会为省略 scheme 的输入补 `http://`
+    （见 lib/core/config/base_url.dart:16）
+  - 两者冲突会导致连本机服务端时报：
+      CLEARTEXT communication to 192.168.x.x not permitted by network security policy
+
+  策略（自用优先，安全可接受）：
+  - base-config 允许明文：自建服务端多在局域网/本机，走 http 最简单
+  - 若要收紧：把 base-config 改为 cleartextTrafficPermitted="false"，
+    只在下方的 domain-config 里列你自己的服务端 IP/域名
+
+  ⚠️ 上架前必须收紧：公网环境下明文 HTTP 会被审核与安全扫描判为风险。
+-->
+<network-security-config>
+    <!-- 允许所有域明文（自用最省事）。上架前请改为 false 并将自己的地址列入下方白名单。 -->
+    <base-config cleartextTrafficPermitted="true" />
+
+    <!-- 常见本地调试地址显式放行（即使将来收紧 base-config 也仍然可用） -->
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- 手机自身回环 -->
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <!-- Android 模拟器访问宿主机（电脑）的专用别名 -->
+        <domain includeSubdomains="true">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

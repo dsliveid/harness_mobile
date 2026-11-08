@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # ★ 第一道门禁：最快，30 秒内即可发现 Go/Dart 双写漂移。
+  # 若排在最后，等 10 分钟 CI 完才失败，代价太大。
+  protocol-gate:
+    name: 协议 fixture 门禁
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出移动端
+        uses: actions/checkout@v4
+
+      - name: 检出服务端（fixture 权威源）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/harness_go
+          path: harness_go
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: 由 Go 权威结构体重新生成 fixture
+        run: cd harness_go && go run scripts/gen-fixtures.go -out ../fixtures
+
+      - name: 校验 fixture 与仓内一致（结构体改动未同步即失败）
+        run: git diff --exit-code fixtures/
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.24.x'
+
+      - run: flutter pub get
+      - name: 黄金 fixture 测试
+        run: flutter test test/protocol/ --reporter expanded
+
+  lint:
+    name: 静态检查 + 红线门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.24.x'
+      - run: flutter pub get
+      - name: flutter analyze（零容忍）
+        run: flutter analyze --fatal-infos --fatal-warnings
+
+      - name: 红线门禁 1 — 日志泄露令牌（R3）
+        run: |
+          if grep -rniE 'print\(.*(token|authorization|secret|password)' lib/; then
+            echo "❌ 日志中出现令牌/凭据明文（违反 R3）"
+            exit 1
+          fi
+
+      - name: 红线门禁 2 — 禁止 dart:ffi 绕过平台通道
+        run: |
+          if grep -rn "dart:ffi" lib/; then
+            echo "❌ 禁止 dart:ffi：平台能力必须经 MethodChannel"
+            exit 1
+          fi
+
+      - name: 红线门禁 3 — 能力标签词表（§6.3.1 / 实施计划 §0.3）
+        run: |
+          # 移动端只允许申报 network + device。
+          # 触发即代表有人误报能力，会让服务端把无法执行的任务派到手机。
+          if grep -rnE '"(process|workspace\.(list|read|write)|llm)"' lib/; then
+            echo "❌ 移动端误报能力标签（本期定案不申报 workspace.* 与 process）"
+            exit 1
+          fi
+
+  test:
+    name: 单元测试 + 覆盖率
+    needs: protocol-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.24.x'
+      - run: flutter pub get
+      - run: flutter test --coverage
+
+      - name: 覆盖率门禁（protocol 层 ≥ 90%）
+        run: |
+          sudo apt-get update && sudo apt-get install -y lcov
+          # lib/protocol 是纯数据层，无理由低覆盖
+          lcov --extract coverage/lcov.info 'lib/protocol/*' -o /tmp/proto.info
+          PCT=$(lcov --summary /tmp/proto.info 2>&1 | grep -oP 'lines\.*: \K[0-9.]+' | head -1)
+          echo "protocol 覆盖率: ${PCT}%"
+          awk -v p="$PCT" 'BEGIN { if (p+0 < 90) { print "❌ protocol 层覆盖率低于 90%"; exit 1 } }'
+
+  build:
+    name: 双端构建
+    needs: [lint, test]
+    runs-on: macos-14 # iOS 构建必须 macOS runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.24.x'
+      - run: flutter pub get
+      - name: Android 构建（未签名占位，正式签名见实施计划 §12.3）
+        run: flutter build apk --release --no-shrink
+      - name: iOS 构建（不签名，仅验证可编译）
+        run: flutter build ios --release --no-codesign

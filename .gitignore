@@ -1,0 +1,60 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+
+# Android 本地产物（不随仓库分发）
+android/.gradle/
+android/local.properties
+# Plugin 注册表是构建期生成物，勿提交
+android/app/src/main/java/io/flutter/plugins/
+
+# iOS 构建期生成物
+ios/Runner/GeneratedPluginRegistrant.*
+
+# 构建与会话临时日志/截图（开发期产物）
+*.log
+screen*.png
+check*.png
+ui*.xml
+redirect.txt
+
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
