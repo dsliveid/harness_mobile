@@ -1,12 +1,15 @@
 /// 应用级会话状态（首屏门禁的唯一事实来源）。
 ///
-/// 启动判定链（架构文档 §5.1）：
+/// 启动判定链（架构文档 §5.1 / §6.1 决策 2）：
 /// ```
 /// 无 baseUrl           → 服务端地址配置页（setup）
 /// 有地址但无 device    → 配对页（pairing）
 /// 已配对但未登录        → 登录页（login）
-/// 二者齐全             → 审批中心（approvals，首屏铁律）
+/// 二者齐全             → 全功能视图（webview，首屏铁律）
 /// ```
+///
+/// 批次 C 变化：身份齐备后的首屏由「审批中心」改为「WebView 主体」
+/// （审批中心 / 会话页 / 投递页已整体删除，见架构文档 §3.2）。
 ///
 /// 令牌本身**永远**只存在 `SecureStore`（红线 R3），本类只持有「是否已登录」的
 /// 布尔视图，绝不缓存 token 明文。
@@ -29,8 +32,8 @@ enum AppStage {
   /// 已配对，未登录账号。
   login,
 
-  /// 身份齐备 → 审批中心。
-  approvals,
+  /// 身份齐备 → 全功能视图（WebView 主体）。
+  webview,
 }
 
 /// 纯函数：由三个事实推导首屏阶段（便于无副订单测）。
@@ -42,7 +45,7 @@ AppStage resolveStage({
   if (baseUrl.isEmpty) return AppStage.setup;
   if (!paired) return AppStage.pairing;
   if (!signedIn) return AppStage.login;
-  return AppStage.approvals;
+  return AppStage.webview;
 }
 
 /// 阶段对应的路由路径。
@@ -54,8 +57,8 @@ String pathOfStage(AppStage stage) {
       return AppRoutes.pairing;
     case AppStage.login:
       return AppRoutes.login;
-    case AppStage.approvals:
-      return AppRoutes.approvals;
+    case AppStage.webview:
+      return AppRoutes.webview;
   }
 }
 
@@ -65,30 +68,20 @@ abstract final class AppRoutes {
   static const String setup = '/setup';
   static const String pairing = '/pairing';
   static const String login = '/login';
-  static const String approvals = '/approvals';
-  static const String sessions = '/sessions';
 
-  /// 全功能视图（WebView 承载服务端 `web/dist`）。
+  /// 首屏（身份齐备）：全功能视图（WebView 承载服务端 `web/dist`）。
   static const String webview = '/webview';
 
   /// 账号页（解绑 / 登出 / 注销降级指引）。
   static const String account = '/account';
 
-  /// 投递页（相册/相机 → base64 内联）。
-  static const String delivery = '/delivery';
-
-  /// 会话消息流：`/sessions/<sid>`。
-  static String sessionMessages(String sessionId) => '/sessions/$sessionId';
-
-  /// 允许在「已进入审批中心」后自由访问的二级页面。
+  /// 允许在「已进入首屏（WebView）」后自由访问的二级页面。
   ///
-  /// 首屏门禁只约束**入口**，不限制用户从审批中心主动进入这些功能页，
+  /// 首屏门禁只约束**入口**，不限制用户从 WebView 主动进入这些功能页，
   /// 否则 redirect 会把用户反复弹回首屏。
   static const Set<String> secondaryPages = {
-    sessions,
     webview,
     account,
-    delivery,
   };
 }
 

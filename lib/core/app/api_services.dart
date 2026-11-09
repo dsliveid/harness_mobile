@@ -3,17 +3,18 @@
 /// 因为 [ApiClient] 在构造时就固定了 `baseUrl`（dio BaseOptions），
 /// 用户改地址必须换一套实例；这里按 baseUrl 做一层极简缓存，
 /// 避免每次 rebuild 都新建 Dio 与拦截器。
+///
+/// 批次 C 精简：审批 / 会话 / 投递三域的 API 与仓储已整体删除
+/// （架构文档 §3.2），这里只保留 认证 / 设备 / WebView 透传 三条链路。
 library;
 
 import 'package:dio/dio.dart';
 
 import '../../data/local/secure_store.dart';
-import '../../data/remote/approval_api.dart';
 import '../../data/remote/auth_api.dart';
 import '../../data/remote/device_api.dart';
 import '../../data/remote/http_client.dart';
-import '../../data/remote/session_api.dart';
-import '../../domain/repositories/approval_repository.dart';
+import '../../data/remote/webview_ticket_api.dart';
 
 /// 一套绑定某 baseUrl 的 API 客户端集合。
 class ApiServices {
@@ -24,8 +25,7 @@ class ApiServices {
     String platform = 'android',
     String appVersion = '0.1.0',
     Dio? dio,
-  })  : client =
-            ApiClient(baseUrl: baseUrl, tokens: tokens, dio: dio),
+  })  : client = ApiClient(baseUrl: baseUrl, tokens: tokens, dio: dio),
         _store = store,
         _platform = platform,
         _appVersion = appVersion;
@@ -46,13 +46,10 @@ class ApiServices {
     appVersion: _appVersion,
   );
 
-  late final SessionApi sessions = SessionApi(client: client);
-
-  late final ApprovalApi approvals = ApprovalApi(client: client);
-
-  late final ApprovalRepository repository = ApprovalRepository(
-    sessions: sessions,
-    approvals: approvals,
+  /// WebView 认证透传（方案 C ticket 签发 + 方案 B Cookie 注入降级）。
+  late final WebViewTicketApi webviewTicket = WebViewTicketApi(
+    client: client,
+    store: _store,
   );
 
   /// 探测服务端连通性（设置页「测试连接」按钮用）。

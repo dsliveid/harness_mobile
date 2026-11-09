@@ -1,18 +1,22 @@
 /// 应用根组件 + 路由表（go_router）。
 ///
-/// **首屏铁律**：身份齐备时首屏**必须**是审批中心（架构文档 §0.1 / §6.1）。
+/// **首屏铁律**：身份齐备时首屏**必须**是全功能视图（WebView 主体，
+/// 架构文档 §3.2 / §6.1 决策 2）。
 /// 启动判定链（[AppSession.stage] 为唯一事实来源）：
 /// ```
 /// 无 baseUrl     → /setup     服务端地址配置
 /// 有地址无 device → /pairing   配对码
-/// 已配对未登录    → /login     账号登录
-/// 二者齐全        → /approvals 审批中心（首屏）
+/// 已配对未登录    → /login     账号登录（**只在原生**，WebView 内无登录表单）
+/// 二者齐全        → /webview   全功能视图（首屏）
 /// ```
 ///
 /// 实现要点：`redirect` 直接读 [AppSession.stage] 推导目标路径，
 /// 并把「用户已在当前阶段页」判掉，避免自我重定向死循环。
 /// `refreshListenable` 绑到 [AppSession]（ChangeNotifier），
 /// 阶段一变 go_router 自动重算 redirect —— 不需要页面自己 push。
+///
+/// 批次 C：审批中心 / 会话列表 / 会话消息 / 投递四个页面已删除，
+/// 对应路由一并移除（深链 `harness://session/<sid>` 改为在 WebView 内定位）。
 library;
 
 import 'package:flutter/material.dart';
@@ -21,12 +25,8 @@ import 'package:go_router/go_router.dart';
 
 import 'core/app/app_session.dart';
 import 'core/app/providers.dart';
-import 'features/approval/approval_center_page.dart';
 import 'features/auth/login_page.dart';
-import 'features/delivery/delivery_page.dart';
 import 'features/pairing/pairing_page.dart';
-import 'features/session/session_list_page.dart';
-import 'features/session/session_messages_page.dart';
 import 'features/settings/account_page.dart';
 import 'features/settings/setup_page.dart';
 import 'features/webview/webview_page.dart';
@@ -64,10 +64,9 @@ class _HarnessMobileAppState extends ConsumerState<HarnessMobileApp> {
         // 身份齐备后，允许在二级功能页之间自由浏览：
         // 首屏门禁只约束**入口**（必须落在审批中心），不限制用户主动进入
         // 会话 / 全功能视图 / 账号 / 投递，否则 redirect 会把用户反复弹回首屏。
-        if (target == AppRoutes.approvals) {
-          if (location == AppRoutes.approvals) return null;
+        if (target == AppRoutes.webview) {
+          if (location == AppRoutes.webview) return null;
           if (AppRoutes.secondaryPages.contains(location)) return null;
-          if (location.startsWith('${AppRoutes.sessions}/')) return null;
         }
         return target;
       },
@@ -87,46 +86,24 @@ class _HarnessMobileAppState extends ConsumerState<HarnessMobileApp> {
           builder: (BuildContext context, GoRouterState state) =>
               const PairingPage(),
         ),
+        // —— 登录只在原生（§6.1 决策 2）：WebView 内不提供登录表单 ——
         GoRoute(
           path: AppRoutes.login,
           builder: (BuildContext context, GoRouterState state) =>
               const LoginPage(),
         ),
-        GoRoute(
-          path: AppRoutes.approvals,
-          builder: (BuildContext context, GoRouterState state) =>
-              const ApprovalCenterPage(),
-        ),
-        GoRoute(
-          path: AppRoutes.sessions,
-          builder: (BuildContext context, GoRouterState state) =>
-              const SessionListPage(),
-        ),
-        GoRoute(
-          path: '/sessions/:sid',
-          builder: (BuildContext context, GoRouterState state) =>
-              SessionMessagesPage(
-            sessionId: state.pathParameters['sid'] ?? '',
-          ),
-        ),
-        // —— 批次 1：全功能视图（WebView 承载服务端 web/dist）——
-        // 低频深水区（项目/工作区/工具市场等）不在原生重做，直接复用 Web UI。
+        // —— 首屏：全功能视图（WebView 承载服务端 web/dist）——
+        // 会话/审批/投递等长尾功能全部由 Web UI 承担，原生不再重做。
         GoRoute(
           path: AppRoutes.webview,
           builder: (BuildContext context, GoRouterState state) =>
               const WebViewPage(),
         ),
-        // —— 批次 1：账号页（含解绑 / 登出 / 注销降级指引）——
+        // —— 账号页（含解绑 / 登出 / 注销降级指引）——
         GoRoute(
           path: AppRoutes.account,
           builder: (BuildContext context, GoRouterState state) =>
               const AccountPage(),
-        ),
-        // —— 批次 2：投递（相册/相机 → base64 内联交给 Agent）——
-        GoRoute(
-          path: AppRoutes.delivery,
-          builder: (BuildContext context, GoRouterState state) =>
-              const DeliveryPage(),
         ),
       ],
     );

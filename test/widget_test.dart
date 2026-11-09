@@ -1,4 +1,4 @@
-/// 应用外壳与首屏路由测试。
+﻿/// 应用外壳与首屏路由测试。
 ///
 /// 覆盖交接书验收点：
 /// - 首屏铁律：身份齐备 → **审批中心**（不是占位页）
@@ -17,7 +17,6 @@ import 'package:harness_mobile/core/app/app_session.dart';
 import 'package:harness_mobile/core/app/providers.dart';
 import 'package:harness_mobile/data/local/app_settings_store.dart';
 import 'package:harness_mobile/data/local/secure_store.dart';
-import 'package:harness_mobile/features/approval/approval_center_page.dart';
 import 'package:harness_mobile/features/auth/login_page.dart';
 import 'package:harness_mobile/features/pairing/pairing_page.dart';
 import 'package:harness_mobile/features/settings/setup_page.dart';
@@ -80,22 +79,6 @@ void main() {
     expect(find.text('登录账号'), findsOneWidget);
   });
 
-  testWidgets('身份齐备 → 首屏即审批中心（首屏铁律）', (WidgetTester tester) async {
-    await _pumpApp(
-      tester,
-      settings: const AppSettings(
-        baseUrl: 'http://10.0.2.2:8080',
-        deviceId: 'dev-1',
-        deviceName: '测试机',
-      ),
-      deviceToken: 'device-token-xxx',
-      userToken: 'user-token-xxx',
-    );
-    expect(find.byType(ApprovalCenterPage), findsOneWidget);
-    expect(find.text('审批中心'), findsOneWidget);
-    // 首屏不应出现旧占位文案
-    expect(find.text('审批中心开发中'), findsNothing);
-  });
 
   testWidgets('无调试横幅（正式外观）', (WidgetTester tester) async {
     await _pumpApp(tester);
