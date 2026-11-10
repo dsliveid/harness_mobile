@@ -3,13 +3,21 @@
 /// 为什么要它：移动端只做「遥控器 + 轻执行」的高频路径，长尾功能（工作区浏览、
 /// 详细配置、账号资料等）在 Web UI 里已经全量存在，内嵌复用即可，不必在端侧重写。
 ///
-/// 三条工程红线：
+/// 四条工程红线：
 /// 1. **不注入令牌**（R3）：页面只拿到 `window.harnessMobile` 能力对象，
 ///    凭据仍留在 Keychain，注入内容见 [buildBridgeScript]。
 /// 2. **绝不白屏**（版本协商）：加载失败 / HTTP 4xx-5xx / 平台视图不可用，
 ///    都退化成可读错误 + 「重试」+「检查服务端地址」，而不是一片空白。
 /// 3. **单向深链**：页面要唤起原生时只能跳 `harness://`，原生拦截并交给
 ///    [parseDeepLink] 白名单解析，原生→页面不存在反向通道。
+/// 4. **首帧必带凭据 + App 级解锁门**（批次 C-4 / C-2，本次接线）：
+///    - 首帧 URL **必须**由 [WebViewTicketApi.prepareAuth] 产出（ticket 优先、
+///      Cookie 降级），**绝不**用裸地址 `webEntryUri(baseUrl)` 直接放行 ——
+///      服务端 Web UI 没有登录表单，裸地址进去只会卡在登录墙/白屏；
+///    - 两条路径都失败时 **fail-closed**：不创建 WebView，展示错误态 + 重试 +
+///      「回账号页重新登录」的下一步指引；
+///    - 身份齐备（[AppStage.webview]）时先过生物识别门禁（[WebViewLock]），
+///      未解锁不创建 WebView（凭据不进内存也进不了页面）。
 library;
 
 import 'dart:async';
@@ -19,8 +27,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../../core/app/api_services.dart';
 import '../../core/app/app_session.dart';
 import '../../core/app/providers.dart';
+import '../../core/app/webview_lock.dart';
+import '../../data/remote/webview_ticket_api.dart';
 import '../shared/ui_helpers.dart';
 import '../shared/web_entry.dart';
 import 'js_bridge.dart';
@@ -171,14 +182,45 @@ class WebViewPage extends ConsumerStatefulWidget {
   ConsumerState<WebViewPage> createState() => _WebViewPageState();
 }
 
+/// 首帧认证彻底失败时的用户文案（fail-closed，**绝不**裸地址放行）。
+///
+/// 为什么要写「回账号页重新登录」：服务端 Web UI **没有登录表单**
+/// （§6.1 决策 2：登录只发生在原生），凭据拿不到时在 WebView 里无论如何
+/// 都进不去，唯一正确的用户动作是回原生身份链路重新走一遍。
+const String kWebViewAuthFailedMessage = '无法为内置页面获取登录凭据：'
+    '一次性票据（ticket）与 Cookie 注入两条路径都不可用。';
+
+/// 是否要把 [WebViewLock] 当作进入 WebView 的门（纯函数，便于单测）。
+///
+/// 设计要点（交接书任务 2 第 4 条）：
+/// 只有「身份齐备且即将进入 WebView 主体」（[AppStage.webview]）时才要求生物识别。
+/// 其余阶段即便本页被渲染出来（例如登出瞬间正在过渡、或测试里直接 pump 本页），
+/// 也**不得**把用户锁死在门口 —— 那些阶段还没有可保护的会话，锁上去只会
+/// 让用户看到一个永远点不开的解锁屏。
+bool shouldGateWebView(AppStage stage) => stage == AppStage.webview;
+
 class _WebViewPageState extends ConsumerState<WebViewPage> {
   MobileWebView? _webView;
 
   /// 已为其创建过实例的 baseUrl（防 build 期重复创建）。
   String? _createdFor;
 
+  /// 认证 / 创建代次：每次「重新创建」自增。
+  ///
+  /// 异步化后的必备护栏：`prepareAuth` 里有网络往返，期间用户可能点重试、
+  /// 切页或回前台重锁。旧请求回来时代次已变，直接丢弃结果，
+  /// 避免「旧凭据覆盖新状态」或对已 unmount 的 widget 调 setState。
+  int _generation = 0;
+
   String? _error;
+
+  /// 当前错误是否属于「拿不到凭据」的 fail-closed 分支（决定是否提示回账号页）。
+  bool _authBlocked = false;
+
   bool _loading = true;
+
+  /// 解锁失败的提示（锁屏内联展示，比 SnackBar 更容易被用户看到与重试）。
+  String? _lockError;
 
   /// 待定位的会话 id（`harness://session/<sid>` 深链暂存）。
   ///
@@ -188,6 +230,7 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
 
   @override
   void dispose() {
+    _generation++;
     _webView?.dispose();
     super.dispose();
   }
@@ -195,7 +238,13 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final baseUrl = ref.watch(appSessionProvider).baseUrl;
+    final session = ref.watch(appSessionProvider);
+    final baseUrl = session.baseUrl;
+
+    // App 级解锁门（批次 C-2）：`watch` 让 UI 随锁状态变化自动重建
+    // （回前台超时重锁由 WebViewLock 内部 observer 负责，这里只响应）。
+    final lock = ref.watch(webViewLockProvider);
+    final gated = shouldGateWebView(session.stage);
 
     if (baseUrl.isEmpty) {
       return Scaffold(
@@ -204,6 +253,30 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
           icon: Icons.language_outlined,
           title: '请先配置服务端地址',
           hint: '内置全功能视图直接加载服务端 Web UI，需要先填写服务端地址并完成配对。',
+        ),
+      );
+    }
+
+    // 未解锁 → 只渲染锁屏，**不创建** WebView（凭据不进内存也进不了页面）。
+    if (gated && lock.isLocked) {
+      // 已创建的实例若因重新加锁（回前台超时 / 手动锁定）而失去意义，
+      // 立刻丢弃，避免锁定期间页面仍持有已注入的凭据。
+      // 放在帧后执行：build 内不能产生副作用。
+      if (_webView != null || _createdFor != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _dropWebView();
+        });
+      }
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('全功能视图'),
+          actions: _actions(null),
+        ),
+        body: _LockState(
+          authenticating: lock.state == WebViewLockState.authenticating,
+          error: _lockError,
+          onUnlock: _unlock,
+          onOpenAccount: () => context.push(AppRoutes.account),
         ),
       );
     }
@@ -250,6 +323,10 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
         message: _error!,
         onRetry: () => _reload(view ?? _webView),
         onOpenSetup: () => context.push(AppRoutes.setup),
+        // 只有「凭据不可用」才引导回账号页重新登录：加载失败与地址错误
+        // 重新登录并无意义，多给一个错误动作只会让用户更困惑。
+        onOpenAccount:
+            _authBlocked ? () => context.push(AppRoutes.account) : null,
       );
     }
     if (view == null) {
@@ -258,23 +335,89 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
     return view.build(context);
   }
 
-  void _ensureWebView(String baseUrl) {
-    if (_createdFor == baseUrl) return;
-    _createdFor = baseUrl;
-    // 平台视图创建必须在帧后执行：create() 可能同步回调 onPageStarted，
-    // 在 build 期间 setState 会直接报错。
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || _createdFor != baseUrl) return;
-      _createWebView(baseUrl);
+  /// 请求解锁（fail-closed：拿不到结果即保持锁定）。
+  ///
+  /// [WebViewLock.unlock] 在闸门抛异常时会**先回滚 locked 再 rethrow**，
+  /// 因此这里必须 catch 住异常并给出可读提示，否则异常会冒到 framework
+  /// 变成红屏；回滚由状态机保证，UI 只需重建（watch 已订阅）。
+  Future<void> _unlock() async {
+    final lock = ref.read(webViewLockProvider);
+    setState(() => _lockError = null);
+    try {
+      final ok = await lock.unlock();
+      if (!mounted) return;
+      if (!ok) {
+        setState(() => _lockError = '身份验证未通过，请重试（不支持跳过验证）');
+      }
+    } on Object catch (error) {
+      if (!mounted) return;
+      // 状态已由状态机回滚到 locked，按钮可再次点击重试。
+      setState(() => _lockError = '解锁失败：${friendlyError(error)}，请重试');
+    }
+  }
+
+  /// 丢弃已创建的 WebView 并要求下次进入重新走认证。
+  void _dropWebView() {
+    final view = _webView;
+    if (view == null && _createdFor == null) return;
+    _generation++;
+    _createdFor = null;
+    _webView = null;
+    view?.dispose();
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+      _authBlocked = false;
     });
   }
 
-  void _createWebView(String baseUrl) {
+  void _ensureWebView(String baseUrl) {
+    if (_createdFor == baseUrl) return;
+    _createdFor = baseUrl;
+    final generation = ++_generation;
+    // 平台视图创建必须在帧后执行：create() 可能同步回调 onPageStarted，
+    // 在 build 期间 setState 会直接报错；认证还有网络往返，更必须在帧后。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || generation != _generation) return;
+      unawaited(_createWebView(baseUrl, generation));
+    });
+  }
+
+  /// 先认证、后创建（批次 C-4 核心）。
+  ///
+  /// 顺序不可颠倒：`initialUrl` 必须在 `create()` 之前就带好凭据，
+  /// 否则页面首帧就会打到「要求登录但没有登录表单」的墙上，用户直接卡死。
+  Future<void> _createWebView(String baseUrl, int generation) async {
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+      _authBlocked = false;
+    });
+
+    final auth = await _prepareAuth(baseUrl);
+    // 每次 await 之后都必须重新校验：widget 可能已 unmount，
+    // 或代次已被「重试 / 重新加锁 / 地址变更」推进（旧结果必须丢弃）。
+    if (!mounted || generation != _generation) return;
+
+    final entry = auth == null ? null : Uri.tryParse(auth.url);
+    if (entry == null) {
+      // fail-closed：**绝不**退回 `webEntryUri(baseUrl)` 裸地址放行。
+      setState(() {
+        _webView = null;
+        _loading = false;
+        _authBlocked = true;
+        _error = kWebViewAuthFailedMessage;
+      });
+      return;
+    }
+
     final factory = widget.webViewFactory ?? defaultWebViewFactory();
     try {
       _webView?.dispose();
       final created = factory.create(
-        initialUrl: webEntryUri(baseUrl) ?? Uri.parse('$baseUrl/'),
+        initialUrl: entry,
         bridgeScript: buildBridgeScript(appVersion: widget.appVersion),
         onPageStarted: (_) {
           if (!mounted) return;
@@ -298,12 +441,18 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
         },
         onNavigationRequest: _handleNavigation,
       );
+      if (!mounted || generation != _generation) {
+        created.dispose();
+        return;
+      }
       setState(() {
         _webView = created;
         _loading = true;
         _error = null;
+        _authBlocked = false;
       });
     } catch (error) {
+      if (!mounted || generation != _generation) return;
       // 平台视图不可创建（测试环境 / 系统 WebView 缺失）→ 不留白屏。
       setState(() {
         _webView = null;
@@ -311,6 +460,42 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
         _error = '当前设备无法创建内置浏览器：${friendlyError(error)}';
       });
     }
+  }
+
+  /// 首帧认证：一次性 ticket 优先，失败降级 Cookie 注入；两条都不行返回 null。
+  ///
+  /// 返回 null 是**唯一**的失败信号，调用方据此 fail-closed。
+  /// 注意：这里用 `ref.read` 而不是 [servicesOf]（后者内部 `watch`），
+  /// 因为本方法在帧后的异步上下文里执行，`watch` 只允许在 build 中使用。
+  Future<WebViewAuthResult?> _prepareAuth(String baseUrl) async {
+    final entry = webEntryUri(baseUrl);
+    if (entry == null) return null;
+
+    final services = _servicesFor(baseUrl);
+    final sink = ref.read(webViewCookieSinkProvider);
+    final deviceId = ref.read(appSessionProvider).deviceId;
+
+    if (services != null) {
+      try {
+        final result = await services.webviewTicket.prepareAuth(
+          baseUrl: baseUrl,
+          entryUrl: entry.toString(),
+          deviceId: deviceId,
+          cookieSink: sink,
+        );
+        if (result.ready) return result;
+      } on Object {
+        // prepareAuth 内部已对 ticket / Cookie 逐级降级，这里只兜极端异常。
+        // 兜底同样是 fail-closed：不返回结果 → 调用方展示错误态。
+      }
+    }
+    return null;
+  }
+
+  /// 取 baseUrl 绑定的 API 集合（异步上下文版，等价于 [servicesOf] 但用 read）。
+  ApiServices? _servicesFor(String baseUrl) {
+    if (baseUrl.isEmpty) return null;
+    return ref.read(apiFactoryProvider).forBaseUrl(baseUrl);
   }
 
   /// 返回 false 表示拦截该导航（不加载）。
@@ -410,18 +595,31 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
 
   Future<void> _reload(MobileWebView? view) async {
     if (view == null) {
+      // 没有实例（认证失败 / 被丢弃）：重新走一遍完整认证流程，
+      // **绝不**退回裸地址（否则点重试等于绕过 fail-closed）。
       final baseUrl = ref.read(appSessionProvider).baseUrl;
       if (baseUrl.isEmpty) return;
-      setState(() {
-        _createdFor = null;
-        _error = null;
-        _loading = true;
-      });
+      _dropWebView();
+      // 解锁门未过的状态下不发起认证：避免带着凭据去创建不该存在的实例。
+      final lock = ref.read(webViewLockProvider);
+      final stage = ref.read(appSessionProvider).stage;
+      if (shouldGateWebView(stage) && lock.isLocked) {
+        setState(() {
+          _loading = false;
+          _error = null;
+          _authBlocked = false;
+        });
+        return;
+      }
+      _createdFor = baseUrl;
+      final generation = ++_generation;
+      unawaited(_createWebView(baseUrl, generation));
       return;
     }
     setState(() {
       _loading = true;
       _error = null;
+      _authBlocked = false;
     });
     try {
       await view.reload();
@@ -455,11 +653,18 @@ class _ErrorState extends StatelessWidget {
     required this.message,
     required this.onRetry,
     required this.onOpenSetup,
+    this.onOpenAccount,
   });
 
   final String message;
   final VoidCallback onRetry;
   final VoidCallback onOpenSetup;
+
+  /// 非空时额外给一个「回账号页重新登录」的出口。
+  ///
+  /// 只用于**凭据不可用**的 fail-closed 分支：Web UI 没有登录表单，
+  /// 拿不到 ticket/Cookie 时用户唯一能自救的动作就是回原生重新登录。
+  final VoidCallback? onOpenAccount;
 
   @override
   Widget build(BuildContext context) {
@@ -483,7 +688,9 @@ class _ErrorState extends StatelessWidget {
             ),
             const SizedBox(height: 6),
             Text(
-              '可能是服务端未启动、地址填错，或该服务端版本未内置 Web 界面。',
+              onOpenAccount == null
+                  ? '可能是服务端未启动、地址填错，或该服务端版本未内置 Web 界面。'
+                  : '内置页面没有登录表单，请回账号页确认登录状态后重试。',
               textAlign: TextAlign.center,
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.outline),
@@ -491,6 +698,8 @@ class _ErrorState extends StatelessWidget {
             const SizedBox(height: 16),
             Wrap(
               spacing: 12,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
               children: <Widget>[
                 FilledButton.icon(
                   onPressed: onRetry,
@@ -502,7 +711,90 @@ class _ErrorState extends StatelessWidget {
                   icon: const Icon(Icons.settings_outlined),
                   label: const Text('检查服务端地址'),
                 ),
+                if (onOpenAccount != null)
+                  OutlinedButton.icon(
+                    onPressed: onOpenAccount,
+                    icon: const Icon(Icons.account_circle_outlined),
+                    label: const Text('回账号页重新登录'),
+                  ),
               ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// App 级解锁门（批次 C-2，架构文档 §4.7.1）。
+///
+/// 位置：身份齐备（[AppStage.webview]）且 [WebViewLock] 未解锁时**替代**整个
+/// WebView 主体渲染。三条铁律在 UI 层的体现：
+/// 1. **无跳过按钮**：只有「解锁」与「回账号页」，后者用于登出而不是绕过；
+/// 2. **fail-closed 可见**：闸门拒绝 / 抛异常都由页面 `_unlock` 转成可读文案
+///    内联展示，用户能看懂并重试，而不是看到一个永久转圈或红屏；
+/// 3. **验证中禁用按钮**：防止连点弹出多个系统验证框（状态机也会拒）。
+class _LockState extends StatelessWidget {
+  const _LockState({
+    required this.authenticating,
+    required this.error,
+    required this.onUnlock,
+    required this.onOpenAccount,
+  });
+
+  final bool authenticating;
+  final String? error;
+  final VoidCallback onUnlock;
+  final VoidCallback onOpenAccount;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            Icon(
+              Icons.fingerprint,
+              size: 56,
+              color: theme.colorScheme.primary,
+            ),
+            const SizedBox(height: 16),
+            Text('解锁后进入工作区', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 6),
+            Text(
+              '为保护本机凭据，进入内置工作区前需要验证指纹或面容。',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.outline),
+            ),
+            if (error != null) ...<Widget>[
+              const SizedBox(height: 12),
+              Text(
+                error!,
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.error),
+              ),
+            ],
+            const SizedBox(height: 20),
+            FilledButton.icon(
+              onPressed: authenticating ? null : onUnlock,
+              icon: authenticating
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.lock_open),
+              label: Text(authenticating ? '正在验证…' : '解锁'),
+            ),
+            const SizedBox(height: 8),
+            TextButton(
+              onPressed: onOpenAccount,
+              child: const Text('回账号页'),
             ),
           ],
         ),
@@ -516,4 +808,3 @@ const String kMobileAppVersion = String.fromEnvironment(
   'APP_VERSION',
   defaultValue: '0.1.0',
 );
-

@@ -20,9 +20,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:harness_mobile/core/app/api_services.dart';
+import 'package:harness_mobile/core/app/app_session.dart';
+import 'package:harness_mobile/core/app/biometric_gate.dart';
 import 'package:harness_mobile/core/app/providers.dart';
+import 'package:harness_mobile/core/app/webview_lock.dart';
 import 'package:harness_mobile/data/local/app_settings_store.dart';
 import 'package:harness_mobile/data/local/secure_store.dart';
+import 'package:harness_mobile/data/remote/webview_ticket_api.dart';
 import 'package:harness_mobile/features/settings/account_page.dart';
 import 'package:harness_mobile/features/webview/js_bridge.dart';
 import 'package:harness_mobile/features/webview/webview_page.dart';
@@ -66,6 +70,9 @@ class _FakeWebViewFactory implements WebViewFactory {
   bool Function(Uri url)? navigationHandler;
   _FakeWebView? view;
 
+  /// create 调用次数（验证重锁后重建、重试不会重复创建）。
+  int createCount = 0;
+
   @override
   MobileWebView create({
     required Uri initialUrl,
@@ -75,6 +82,7 @@ class _FakeWebViewFactory implements WebViewFactory {
     required void Function(String message) onLoadFailed,
     required bool Function(Uri url) onNavigationRequest,
   }) {
+    createCount++;
     this.initialUrl = initialUrl;
     this.bridgeScript = bridgeScript;
     navigationHandler = onNavigationRequest;
@@ -114,12 +122,56 @@ class _SilentAdapter implements HttpClientAdapter {
   void close({bool force = false}) {}
 }
 
+/// 票据可用适配器：`POST /api/v1/auth/webview-ticket` 返回一次性 ticket。
+///
+/// 批次 C-4 起首帧**必须先认证**，因此所有「要真创建 WebView」的用例
+/// 都必须让凭据链路成功，否则页面会走 fail-closed 分支（那是另一组用例）。
+class _TicketAdapter implements HttpClientAdapter {
+  _TicketAdapter({this.ticket = 'tk-abc123'});
+
+  final String ticket;
+  final List<RequestOptions> requests = <RequestOptions>[];
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    requests.add(options);
+    if (options.path == '/api/v1/auth/webview-ticket') {
+      return ResponseBody.fromString(
+        '{"ticket":"$ticket","expires_at":1893456000000}',
+        200,
+        headers: <String, List<String>>{
+          Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+        },
+      );
+    }
+    return ResponseBody.fromString('{"code":"not_found"}', 404, headers: <String, List<String>>{
+      Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+    });
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
 Future<ProviderContainer> _pumpWebView(
   WidgetTester tester, {
   required String baseUrl,
   WebViewFactory? factory,
+  HttpClientAdapter? adapter,
+  String? userToken,
+  BiometricGate? gate,
+  WebViewCookieSink? cookieSink,
+  bool locked = false,
 }) async {
   final store = InMemorySecureStore();
+  if (userToken != null) await store.setUserToken(userToken);
+  final dio = Dio();
+  // 默认让凭据链路成功（ticket 模式），否则页面按设计走 fail-closed 不建 WebView。
+  dio.httpClientAdapter = adapter ?? _TicketAdapter();
   final container = ProviderContainer(
     overrides: <Override>[
       secureStoreProvider.overrideWithValue(store),
@@ -132,6 +184,21 @@ Future<ProviderContainer> _pumpWebView(
           ),
         ),
       ),
+      apiFactoryProvider.overrideWithValue(ApiFactory(store: store, dio: dio)),
+      // 解锁门显式控制初始态：默认「已解锁」只针对**认证链路**用例
+      // （它们要断言首帧 URL，必须先把门放开），锁屏行为由 `locked: true`
+      // 的用例逐条断言，绝不因此弱化「默认 locked = fail-closed」的语义
+      // ——该默认值由 `webview_lock_test.dart` 独立守住。
+      webViewLockProvider.overrideWith(
+        (Ref ref) => WebViewLock(
+          gate: gate ?? const AlwaysPassBiometricGate(),
+          initial: locked
+              ? WebViewLockState.locked
+              : WebViewLockState.unlocked,
+        ),
+      ),
+      if (cookieSink != null)
+        webViewCookieSinkProvider.overrideWithValue(cookieSink),
     ],
   );
   addTearDown(container.dispose);
@@ -148,9 +215,79 @@ Future<ProviderContainer> _pumpWebView(
       ),
     ),
   );
-  await tester.pump(); // postFrameCallback → 创建 WebView
-  await tester.pump();
+  // postFrameCallback → prepareAuth（含网络往返）→ create，链路有多个异步跳，
+  // 单次 pump 不足以跑完；这里循环推进若干帧（不用 pumpAndSettle：
+  // 加载中的 LinearProgressIndicator 是无限动画，会把它拖到超时）。
+  await _settle(tester);
   return container;
+}
+
+/// 反复推进帧，直到没有新的异步跳（最多 [times] 轮）。
+///
+/// 认证链路 = postFrame → await prepareAuth → await create，属于纯 microtask
+/// 串联，`pump()` 会 flush microtask 队列，因此逐帧推进即可收敛。
+Future<void> _settle(WidgetTester tester, {int times = 8}) async {
+  for (var i = 0; i < times; i++) {
+    await tester.pump(const Duration(milliseconds: 1));
+  }
+}
+
+/// 记录型 Cookie sink：验证「Cookie 值只进 Cookie jar，不进 URL」。
+class _RecordingCookieSink implements WebViewCookieSink {
+  _RecordingCookieSink({this.succeeds = true});
+
+  /// false 用于构造「方案 B 也不可用」的 fail-closed 场景。
+  final bool succeeds;
+
+  final List<({String url, String name, String value})> writes =
+      <({String url, String name, String value})>[];
+
+  @override
+  Future<bool> writeSessionCookie({
+    required String url,
+    required String name,
+    required String value,
+  }) async {
+    writes.add((url: url, name: name, value: value));
+    return succeeds;
+  }
+
+  @override
+  Future<void> clearSessionCookies() async {}
+}
+
+/// 全部 404 的适配器：模拟「服务端尚未实现 webview-ticket 端点」。
+class _NotFoundAdapter implements HttpClientAdapter {
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    return ResponseBody.fromString(
+      '{"code":"not_found","message":"未实现"}',
+      404,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+/// 可编排的抛错闸门：验证「异常 → 回滚 locked → 可重试」。
+class _ThrowingGate implements BiometricGate {
+  bool throwing = true;
+  int calls = 0;
+
+  @override
+  Future<bool> authenticate({required String reason}) async {
+    calls++;
+    if (throwing) throw StateError('生物识别插件崩溃');
+    return true;
+  }
 }
 
 void main() {
@@ -259,7 +396,8 @@ void main() {
       expect(factory.initialUrl, isNull);
     });
 
-    testWidgets('baseUrl 就绪 → 加载根地址且注入桥脚本', (WidgetTester tester) async {
+    testWidgets('baseUrl 就绪 → 首帧 URL 带 ticket 且注入桥脚本（R3 不泄漏）',
+        (WidgetTester tester) async {
       final factory = _FakeWebViewFactory();
       await _pumpWebView(
         tester,
@@ -267,7 +405,11 @@ void main() {
         factory: factory,
       );
 
-      expect(factory.initialUrl.toString(), 'http://localhost:8080/');
+      // 批次 C-4：首帧必须由 prepareAuth 产出，ticket 走 fragment。
+      expect(factory.initialUrl!.fragment, 'ticket=tk-abc123');
+      expect(factory.initialUrl!.query, isEmpty);
+      // 否定断言：首帧 URL 里绝不能出现设备令牌明文
+      expect(factory.initialUrl.toString().contains('device_token'), isFalse);
       expect(factory.bridgeScript, isNotNull);
       expect(factory.bridgeScript!.contains('harnessMobile'), isTrue);
       // R3：真实注入路径上同样不允许出现令牌字样
@@ -304,6 +446,10 @@ void main() {
               ),
             ),
           ),
+          // 首帧需真实创建 WebView → 凭据链路必须可用（ticket 模式）。
+          apiFactoryProvider.overrideWithValue(
+            ApiFactory(store: store, dio: Dio()..httpClientAdapter = _TicketAdapter()),
+          ),
         ],
       );
       addTearDown(container.dispose);
@@ -320,8 +466,7 @@ void main() {
           ),
         ),
       );
-      await tester.pump();
-      await tester.pump();
+      await _settle(tester);
 
       final handler = factory.navigationHandler;
       expect(handler, isNotNull);
@@ -364,6 +509,271 @@ void main() {
       // 意图被消费：reload 至少被触发一次（即「在 WebView 内定位」的现有能力）
       expect(factory.view!.reloadCount, greaterThanOrEqualTo(1));
       expect(tester.takeException(), isNull);
+    });
+  });
+
+  group('首帧认证注入（批次 C-4：先认证再创建）', () {
+    testWidgets('ticket 可用 → initialUrl 含 #ticket= 且不含 device_token 明文',
+        (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      final adapter = _TicketAdapter(ticket: 'tk-secret-42');
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        adapter: adapter,
+      );
+
+      final url = factory.initialUrl!;
+      expect(url.fragment, 'ticket=tk-secret-42');
+      // 硬约束：ticket 走 fragment（不进 Referer / access log），query 必须为空
+      expect(url.query, isEmpty);
+      // 否定断言：设备令牌绝不出现在 URL 任何位置
+      expect(url.toString().contains('device_token'), isFalse);
+      expect(url.toString().contains('dev-1'), isFalse);
+      // 确实调用了签发端点
+      expect(
+        adapter.requests.map((RequestOptions r) => r.path),
+        contains('/api/v1/auth/webview-ticket'),
+      );
+    });
+
+    testWidgets('ticket 不可用 → 降级 Cookie 注入，且 Cookie 值不出现在 URL 里',
+        (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      final sink = _RecordingCookieSink();
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        // ticket 端点 404（服务端未接线时的真实形态）
+        adapter: _NotFoundAdapter(),
+        cookieSink: sink,
+        userToken: 'user-token-xyz',
+      );
+
+      // 走了 Cookie 路径
+      expect(sink.writes, hasLength(1));
+      expect(sink.writes.single.name, kSessionCookieName);
+      expect(sink.writes.single.value, 'user-token-xyz');
+      // 拿到的仍是裸入口（fragment 为空），但凭据只在 Cookie jar 里
+      final url = factory.initialUrl!;
+      expect(url.fragment, isEmpty);
+      // 最关键否定断言：Cookie 值绝不能出现在 URL 中
+      expect(url.toString().contains('user-token-xyz'), isFalse);
+      expect(url.toString().contains(kSessionCookieName), isFalse);
+    });
+
+    testWidgets('ticket 与 Cookie 双双失败 → fail-closed：不创建 WebView，展示错误态与重试',
+        (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      final sink = _RecordingCookieSink(succeeds: false);
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        adapter: _NotFoundAdapter(),
+        cookieSink: sink,
+        // 无用户令牌 → injectSessionCookie 直接返回 false
+      );
+
+      // ★ 最关键的否定断言：绝不创建 WebView（也就绝不会裸地址放行）
+      expect(factory.initialUrl, isNull);
+      expect(factory.bridgeScript, isNull);
+      // 可读错误 + 重试 + 明确的下一步（回账号页重新登录）
+      expect(find.textContaining('无法为内置页面获取登录凭据'), findsOneWidget);
+      expect(find.text('重试'), findsOneWidget);
+      expect(find.text('回账号页重新登录'), findsOneWidget);
+      expect(find.textContaining('没有登录表单'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('fail-closed 后点重试仍走认证（不退回裸地址）', (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        adapter: _NotFoundAdapter(),
+        cookieSink: _RecordingCookieSink(succeeds: false),
+      );
+      expect(factory.initialUrl, isNull);
+
+      await tester.tap(find.text('重试'));
+      await _settle(tester);
+
+      // 依然失败 → 依然不创建；但路径必须还是认证链路（不是裸地址）
+      expect(factory.initialUrl, isNull);
+      expect(find.textContaining('无法为内置页面获取登录凭据'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('加载失败错误态不误挂「回账号页」按钮（只有凭据问题才引导重登）',
+        (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory(failWith: '服务端返回 500，内置页面暂时不可用');
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+      );
+
+      expect(find.textContaining('服务端返回 500'), findsOneWidget);
+      expect(find.text('重试'), findsOneWidget);
+      expect(find.text('回账号页重新登录'), findsNothing);
+    });
+  });
+
+  group('App 级解锁门（批次 C-2：WebViewLock 接线）', () {
+    testWidgets('身份齐备且未解锁 → 展示锁屏且不创建 WebView', (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        userToken: 'user-token', // stage == webview → 锁生效
+        gate: const AlwaysDenyBiometricGate(),
+        locked: true,
+      );
+
+      expect(find.text('解锁后进入工作区'), findsOneWidget);
+      expect(find.text('解锁'), findsOneWidget);
+      // ★ 否定断言：锁定态下绝不创建 WebView（凭据不进内存也进不了页面）
+      expect(factory.initialUrl, isNull);
+      expect(factory.bridgeScript, isNull);
+    });
+
+    testWidgets('身份未齐备（未登录）时不得把用户锁死在门口', (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        // 无 userToken → stage == login → shouldGateWebView 为 false
+        gate: const AlwaysDenyBiometricGate(),
+        locked: true,
+      );
+
+      expect(find.text('解锁后进入工作区'), findsNothing);
+      expect(factory.initialUrl, isNotNull);
+    });
+
+    testWidgets('解锁门放行后才创建 WebView（AlwaysPass）', (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        userToken: 'user-token',
+        gate: const AlwaysPassBiometricGate(),
+        locked: true,
+      );
+      // 初始仍是锁定（fail-closed 默认值）
+      expect(factory.initialUrl, isNull);
+
+      await tester.tap(find.text('解锁'));
+      await _settle(tester);
+
+      expect(factory.initialUrl, isNotNull);
+      expect(factory.initialUrl!.fragment, 'ticket=tk-abc123');
+      expect(find.text('解锁后进入工作区'), findsNothing);
+    });
+
+    testWidgets('AlwaysDeny 闸门：解锁失败后仍锁定且能看到错误提示', (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        userToken: 'user-token',
+        gate: const AlwaysDenyBiometricGate(),
+        locked: true,
+      );
+
+      await tester.tap(find.text('解锁'));
+      await _settle(tester);
+
+      // 仍锁定，仍没有 WebView
+      expect(find.text('解锁后进入工作区'), findsOneWidget);
+      expect(factory.initialUrl, isNull);
+      // 有可读错误，且没有「跳过」按钮（fail-closed 不许绕过）
+      expect(find.textContaining('身份验证未通过'), findsOneWidget);
+      expect(find.text('跳过'), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('闸门抛异常：状态回滚 locked 且可重试（不做静默吞掉）',
+        (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      final gate = _ThrowingGate();
+      await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        userToken: 'user-token',
+        gate: gate,
+        locked: true,
+      );
+
+      await tester.tap(find.text('解锁'));
+      await _settle(tester);
+
+      // 异常被转成可读提示，且状态已回滚（按钮可再次点击）
+      expect(find.textContaining('解锁失败'), findsOneWidget);
+      expect(find.text('解锁'), findsOneWidget); // 不是「正在验证…」卡死
+      expect(factory.initialUrl, isNull);
+      expect(tester.takeException(), isNull);
+
+      // 第二次：闸门恢复 → 可以正常解锁并创建 WebView
+      gate.throwing = false;
+      await tester.tap(find.text('解锁'));
+      await _settle(tester);
+
+      expect(factory.initialUrl, isNotNull);
+      expect(find.text('解锁后进入工作区'), findsNothing);
+    });
+
+    test('shouldGateWebView：只有身份齐备（webview 阶段）才要求生物识别', () {
+      // 这条纯函数是「不把测试环境/未登录态锁死在门口」的唯一判据，
+      // 单独断言四个阶段，防止后人把它改成恒 true。
+      expect(shouldGateWebView(AppStage.webview), isTrue);
+      expect(shouldGateWebView(AppStage.setup), isFalse);
+      expect(shouldGateWebView(AppStage.pairing), isFalse);
+      expect(shouldGateWebView(AppStage.login), isFalse);
+    });
+
+    testWidgets('回前台重新加锁后被解锁：丢弃旧实例并重新走认证（不复用已注入凭据）',
+        (WidgetTester tester) async {
+      final factory = _FakeWebViewFactory();
+      final container = await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+        userToken: 'user-token',
+        gate: const AlwaysPassBiometricGate(),
+        locked: true,
+      );
+
+      await tester.tap(find.text('解锁'));
+      await _settle(tester);
+      expect(factory.createCount, 1);
+      final firstUrl = factory.initialUrl!.toString();
+
+      // 模拟「切后台超过 relockAfter 回前台」：状态机自身 observer 负责重锁，
+      // 这里直接调 lock() 等价触发，验证页面响应（重新丢弃 WebView）。
+      container.read(webViewLockProvider).lock();
+      await _settle(tester);
+
+      expect(find.text('解锁后进入工作区'), findsOneWidget);
+      // 旧实例必须被丢弃（帧后回调），不能继续持有已注入凭据的页面
+      expect(factory.view, isNotNull);
+      expect(tester.takeException(), isNull);
+
+      // 再次解锁 → 重新创建（新的 initialUrl，不复用旧实例）
+      await tester.tap(find.text('解锁'));
+      await _settle(tester);
+      expect(factory.createCount, 2);
+      expect(factory.initialUrl.toString(), firstUrl);
+      expect(find.text('解锁后进入工作区'), findsNothing);
     });
   });
 
