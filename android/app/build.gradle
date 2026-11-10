@@ -10,7 +10,11 @@ android {
     // 显式指定 35：flutter_plugin_android_lifecycle 与 sqlite3_flutter_libs
     // 都要求 compileSdk >= 35（向后兼容，不影响 minSdk 的旧设备）
     compileSdk = 35
-    ndkVersion = flutter.ndkVersion
+    // 🔴 ndkVersion 已移除（2026-11，首次 Android 构建实测）：
+    //   原为 `ndkVersion = flutter.ndkVersion`，会强制 sdkmanager 安装 NDK 28.2.13676358。
+    //   批次 C 注销本地执行、且已移除 sqlite3_flutter_libs 后，本项目**无任何原生 C/C++ 源码**，
+    //   继续声明 ndkVersion 只会带来数百 MB 无谓下载与构建前置失败。
+    //   将来若重新引入带原生源码的插件（如做离线库），需恢复此声明并安装对应 NDK。
 
     // Java 17：与 Gradle 8.7 / AGP 8.6.1 / Kotlin 1.9.24 构建链对齐（JDK 21 运行）。
     // 原为 VERSION_1_8，在 JDK 21 的 javac 下会刷 "source value 8 is obsolete" 警告。

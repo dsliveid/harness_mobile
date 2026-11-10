@@ -16,7 +16,7 @@ harness **移动端客户端**：**Flutter + Dart** 单代码仓（Android / iOS
 | **批次 1** | WebView 全功能视图 / 最小 JS 桥 / 账号页 / iOS·Android 上架材料 | ✅ 已交付 |
 | ~~批次 2-1~~ | ~~相册/相机 → base64 投递（≤2MB）+ 重试队列~~ | ❌ **已注销**：`features/delivery`、`delivery_api.dart`、`delivery_queue.dart` 随 `15767d3` 整体删除 |
 | ~~批次 2-2/2-3~~ | ~~`task.dispatch` 白名单执行与 result 回传~~ | ❌ **已注销**：架构上放弃手机端本地执行（协议层 `TaskResultPayload` 仍保留，恒 `source_trust=untrusted`，仅作解码用） |
-| **批次 C** | **架构收口为 WebView 主体**：删除审批/会话/投递三域（含页面、仓储、data 层、路由），新增 App 级生物识别解锁门 `webview_lock.dart`、一次性票据透传 `webview_ticket_api.dart`、工作空间只读 `workspace_api.dart`；构建链升级为 JDK 21 + Gradle 8.7 + AGP 8.6.1 | ✅ 删除与协议/身份链路已完成（`15767d3` / `4f2bfd3`）；`webview_ticket_api.dart` 已接入 `api_services.dart` 并由 `harness://reauth` 深链实际调用；⚠️ 首帧入口的 ticket fragment 注入与 `webview_lock.dart` 的 UI 挂载仍待接线（当前 `WebViewPage` 仍用 `webEntryUri(baseUrl)` 裸加载），随批次 3 收尾 |
+| **批次 C** | **架构收口为 WebView 主体**：删除审批/会话/投递三域（含页面、仓储、data 层、路由），新增 App 级生物识别解锁门 `webview_lock.dart`、一次性票据透传 `webview_ticket_api.dart`、工作空间只读 `workspace_api.dart` | ✅ **已完成（含接线）**：删除与协议/身份链路已落地（`15767d3` / `4f2bfd3`）；`webview_lock.dart` 与 `webview_ticket_api.dart` 已由提交 `22ebbe5` 完成 UI 挂载与首帧认证注入（`webViewLockProvider` 已注入、`WebViewPage._prepareAuth` 已调用 `services.webviewTicket.prepareAuth`，首帧 URL 带 ticket fragment）；构建链已升级（见下方技术栈行） |
 | 批次 3 | 回前台 resync 编排 / 连接态诚实化 UI | 🔜 待开发（`device_ws.dart` 尚无生命周期钩子，`WebViewLock` 只做锁与重新验真，不做数据重拉） |
 | 批次 4 | 推送 / 大文件分片上传 / 增量同步 | ⏸ 阻塞于服务端（B1/B5/B3 缺口） |
 
@@ -28,9 +28,31 @@ flutter test                                     → All tests passed!（182 用
 flutter build windows --debug                    → √ Built build\windows\x64\runner\Debug\harness_mobile.exe
 ```
 
-> `flutter build windows` 是**开发期调试门禁**（非分发目标）：本机 Android 模拟器在
-> 内存受限时不可用（1024MB 时系统 boot 完成但 Qt 渲染层崩、1536MB 时 qemu 实占 3.6GB），
-> 改用 Windows 桌面验证 Web 工作区。落盘体积 0.6MB，实跑内存约 367MB。
+> ### 📌 验证平台规则（2026-11 实测确立，**长期有效**）
+>
+> **功能与流程验证统一走 Windows 桌面模式；Android 打包验证延后、单独执行。**
+>
+> **为什么**（实测原因，非偏好）：
+> 1. **本机内存硬约束**：物理内存 15.6G 但常驻空闲仅 2~3G，页面文件固定 2048MB。
+>    Android 构建需同时拉起 Gradle daemon + Kotlin 编译 + Dart VM，实测导致
+>    `Failed to reserve memory for new overflow mark stack` 乃至
+>    **Dart VM 自身 `runtime/vm/zone.cc:95 Out of memory`** 崩溃 —— 这是资源问题，非代码缺陷。
+> 2. **NDK 依赖**：`path_provider_android 2.3.0+` 经 `jni` 引入 C++ 源码（CMake），
+>    强制要求 NDK 27.0.12077973；本机未装 NDK。已通过 `dependency_overrides`
+>    锁定 `path_provider_android: 2.2.23`（无 jni）先行规避。
+> 3. **Windows 模式覆盖度足够**：`flutter_inappwebview` 在 Windows 走 WebView2，
+>    WebView 主体、票据首帧注入、生物识别解锁门、路由与深链等**主流程均可验证**；
+>    367MB 实跑内存 vs 模拟器 3.6GB，迭代成本低一个数量级。
+>
+> **适用范围与边界**：
+> - ✅ Windows 可验证：WebView 主体与业务界面、票据/认证注入、解锁门、路由与深链、WS 连接、账号页。
+> - ⚠️ Windows **无法验证**（须留待 Android/iOS）：`onShowFileChooser` / `runOpenPanelWith` 文件选择器、指纹/生物识别真机闸门、FCM/APNs 推送、Keystore/Keychain。
+> - ❗ 涉及上述平台专属能力的功能，**不得以「Windows 通过」宣称交付完成**，须显式标注「待 Android/iOS 验证」。
+>
+> **Android 侧已修复但未最终验证的构建链改动**（待后续单独验证时复核）：
+> Gradle `8.7 → 8.14.3`、AGP `8.6.1 → 8.11.1`、Kotlin `1.9.24 → 2.2.20`、
+> JVM 内存下调（`-Xmx1280m` / Metaspace `512m` / `workers.max=1` / Kotlin 进程内编译）、
+> 移除 `ndkVersion` 声明、摘除死依赖 `drift`/`sqlite3_flutter_libs`/`drift_dev`。
 
 ---
 
@@ -39,7 +61,7 @@ flutter build windows --debug                    → √ Built build\windows\x64
 | 层 | 选型 | 为什么 |
 | --- | --- | --- |
 | 业务与 UI（~85%） | **Dart 3.13 / Flutter 3.47**（`pubspec.yaml` 门槛仍为 `flutter >=3.24.0` / `sdk >=3.5.0`） | 编译期类型安全（sealed/records 表达协议帧）；单一工具链 `analyze + test`，CI 无需真机 |
-| Android 构建链 | **JDK 21 + Gradle 8.7 + AGP 8.6.1 + Kotlin 1.9.24**，`compileSdk 35`，Java 目标 17 | JDK 21 为唯一安装版本；Gradle 8.3 及以下在 JDK 21 上跑不起来，8.7 是 Flutter tool 的已知兼容上限 |
+| Android 构建链 | **JDK 21 + Gradle 8.14.3 + AGP 8.11.1 + Kotlin 2.2.20**，`compileSdk 35`，Java 目标 17 | ⚠️ 2026-11 实测升级：Flutter 3.47.9 的硬下限为 Gradle **8.14.0** / AGP **8.11.1** / Kotlin **2.2.20**（见 `flutter_tools/gradle/.../DependencyVersionChecker.kt`）。原组合 8.7 / 8.6.1 / 1.9.24 是 Flutter 3.24 时代的写法，**在 3.47.9 下已被拒绝构建**；旧文档「Gradle 8.7 是 Flutter tool 的已知兼容上限」的表述已失效。 |
 | Android 平台通道 | Kotlin（minSdk 24） | 只做 FCM / Keystore / 生物识别的「能力代理」，不发 HTTP、不解析协议 |
 | iOS 平台通道 | Swift 5.9（iOS 14+） | 同上，只做 APNs / Keychain / LocalAuthentication |
 | WebView 视图 | **`flutter_inappwebview ^6.1.5`**（Android/iOS 走原生 WebView，Windows 走 WebView2） | 业务界面**唯一归属**（会话/审批/工作区/工具市场）；**仓内 0 行 TypeScript**。选它而非 `webview_flutter`：后者只有 android/ios/macos 实现，**没有任何 Windows 路径** |

@@ -21,8 +21,12 @@ dependencies:
   http: ^1.2.0
 
   # —— 本地存储 ——
-  drift: ^2.20.0
-  sqlite3_flutter_libs: ^0.5.24
+  # 🔴 drift / sqlite3_flutter_libs / drift_dev 已移除（2026-11，首次 Android 构建实测）：
+  #   批次 C 架构收口后本地执行与离线库整体注销，lib/ 与 test/ 对 drift 均为零引用，
+  #   但二者仍在 pubspec 存活，导致 sqlite3_flutter_libs 把 NDK 编入 Android 构建链，
+  #   触发 "Android sdkmanager did not install NDK 28.2.13676358" 的硬失败。
+  #   移除后零功能影响（无任何 Dart 代码引用），且 Android 构建不再需要 NDK。
+  #   将来若真要做离线库，需同时恢复依赖并安装对应 NDK。
   flutter_secure_storage: ^9.2.2
   path_provider: ^2.1.4
 
@@ -50,11 +54,20 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^4.0.0
-  drift_dev: ^2.20.0
   build_runner: ^2.4.12
   mocktail: ^1.0.4
   # 时间旅行测试：退避/心跳定时器必须能在虚拟时钟里快进（P6 连接层）
   fake_async: ^1.3.1
+
+# 🔴 dependency_overrides（2026-11，首次 Android 构建实测）：
+#   path_provider_android 2.3.0+ 改为经 `jni` 直调 Java API，而 jni 自带 C++ 源码
+#   （android/build.gradle 有 externalNativeBuild + CMakeLists.txt），会强制 AGP
+#   要求 NDK 27.0.12077973，本机无 NDK 则 Android 构建直接失败。
+#   实测 2.2.23 的依赖仅 flutter + path_provider_platform_interface，**不含 jni**，
+#   且 API 完全兼容（path_provider 主包未变），故锁定之，使 Android 构建无需 NDK。
+#   将来若需 jni 能力或升级 path_provider，须同时安装对应 NDK 并移除本覆盖。
+dependency_overrides:
+  path_provider_android: 2.2.23
 
 flutter:
   uses-material-design: true
