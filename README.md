@@ -24,8 +24,13 @@ harness **移动端客户端**：**Flutter + Dart** 单代码仓（Android / iOS
 
 ```
 flutter analyze --fatal-infos --fatal-warnings   → No issues found!
-flutter test                                     → All tests passed!（170 用例；本仓 test/ 现为 11 个文件）
+flutter test                                     → All tests passed!（182 用例；本仓 test/ 现为 11 个文件）
+flutter build windows --debug                    → √ Built build\windows\x64\runner\Debug\harness_mobile.exe
 ```
+
+> `flutter build windows` 是**开发期调试门禁**（非分发目标）：本机 Android 模拟器在
+> 内存受限时不可用（1024MB 时系统 boot 完成但 Qt 渲染层崩、1536MB 时 qemu 实占 3.6GB），
+> 改用 Windows 桌面验证 Web 工作区。落盘体积 0.6MB，实跑内存约 367MB。
 
 ---
 
@@ -37,7 +42,8 @@ flutter test                                     → All tests passed!（170 用
 | Android 构建链 | **JDK 21 + Gradle 8.7 + AGP 8.6.1 + Kotlin 1.9.24**，`compileSdk 35`，Java 目标 17 | JDK 21 为唯一安装版本；Gradle 8.3 及以下在 JDK 21 上跑不起来，8.7 是 Flutter tool 的已知兼容上限 |
 | Android 平台通道 | Kotlin（minSdk 24） | 只做 FCM / Keystore / 生物识别的「能力代理」，不发 HTTP、不解析协议 |
 | iOS 平台通道 | Swift 5.9（iOS 14+） | 同上，只做 APNs / Keychain / LocalAuthentication |
-| WebView 视图 | 加载服务端 `web/dist` | 业务界面**唯一归属**（会话/审批/工作区/工具市场）；**仓内 0 行 TypeScript** |
+| WebView 视图 | **`flutter_inappwebview ^6.1.5`**（Android/iOS 走原生 WebView，Windows 走 WebView2） | 业务界面**唯一归属**（会话/审批/工作区/工具市场）；**仓内 0 行 TypeScript**。选它而非 `webview_flutter`：后者只有 android/ios/macos 实现，**没有任何 Windows 路径** |
+| 桌面调试目标（非分发） | **Windows Desktop**（`windows/` 平台骨架 + WebView2 Runtime + NuGet CLI） | 让 Web 工作区能在本机低开销迭代（367MB vs 模拟器 3.6GB）；**不作为交付形态**，真机能力（指纹/相册/推送）仍只能在 Android/iOS 验证 |
 
 **刻意不做过的事**（见 `../harness_go/docs/移动端架构与功能设计.md` §6.3.1）：
 
@@ -48,7 +54,7 @@ flutter test                                     → All tests passed!（170 用
 
 ---
 
-## 三、代码地图（lib/ 共 28 个文件）
+## 三、代码地图（lib/ 共 29 个文件）
 
 ```
 lib/
@@ -99,7 +105,9 @@ lib/
 
 > 已删除（随 `15767d3` 架构收口）：`features/approval/`、`features/session/`、`features/delivery/`、`domain/repositories/approval_repository.dart`、`data/remote/{approval,session,delivery}_api.dart`、`data/ws/sse_client.dart`。深链 `harness://session/<sid>` 改为进 WebView 后在 Web 内定位，`harness://approval/...` 已被白名单拒绝。
 
-**测试（11 个文件，170 用例）**：
+**平台目录**：`android/`（自用运行目标）、`ios/`（材料齐备但未实机验证）、`windows/`（**开发期调试目标，18 个构建源文件**，不作为分发形态）。
+
+**测试（11 个文件，182 用例）**：
 
 | 测试文件 | 防什么 |
 | --- | --- |
@@ -245,13 +253,14 @@ go run scripts/gen-fixtures.go -out ../harness_mobile/fixtures
 
 | # | 限制 | 说明 |
 | --- | --- | --- |
-| 1 | 服务端无推送链路（B1 未实现） | 推送相关逻辑暂无；`pubspec.yaml` 仍留 `firebase_messaging` / `flutter_local_notifications` 依赖，`lib/` 内**零引用**，待服务端就绪再接线 |
+| 1 | 服务端无推送链路（B1 未实现） | 推送相关逻辑暂无；`firebase_messaging` / `firebase_core` 已**移除**（2026-11，Windows 构建阻塞所致：其包内藏着未声明的 `windows/` C++ 实现，会链 `firebase_cpp_sdk` 失败），`flutter_local_notifications` 仍在但 `lib/` 内**零引用**。将来接推送需重新引入并按平台条件加载 |
 | 2 | 业务界面全在 WebView（含审批/会话/投递） | 原生不再重做 UI；WebView 不可用（地址错、服务端挂、版本不兼容）时只能给错误态 + 重试，无原生兜底页 |
 | 3 | WebView 认证透传服务端未接线 | ticket 端点（①/③）未实现，端侧 `prepareAuth` 也只能降级到「注入会话 Cookie」；且 `webview_ticket_api.dart` 尚未接入 `WebViewPage`，当前 WebView 实际是**裸加载入口 URL**，Web 侧登录态失效即需用户重进（`harness://reauth` 深链为其预留入口） |
 | 4 | 回前台不做数据重拉（批次 3 待办） | `device_ws.dart` 无 `WidgetsBindingObserver` 钩子；`WebViewLock` 只处理锁/重新验真，不做数据 resync，且尚未接线 |
 | 5 | 无增量同步参数（B3） | 服务端无 `updated_since` / `since_seq`，Web 侧只能全量 + 分页 |
 | 6 | 账号注销依赖 Web 端 | 服务端无注销端点；App 内提供解绑 + Web 指引降级 |
-| 7 | 移动端不执行本地任务 | `task.dispatch` 白名单执行为架构收口主动放弃（批次 2-2/2-3 已注销），不是待办 |
+| 7 | Windows 桌面未做真机能力验证 | `flutter build windows` 可跑通 Web 工作区，但 `local_auth`(Windows Hello) / `image_picker`(文件选择器) 语义与手机不同，推送无 Windows 实现；**指纹/相册/推送三项只能在 Android/iOS 真机验证** |
+| 8 | 移动端不执行本地任务 | `task.dispatch` 白名单执行为架构收口主动放弃（批次 2-2/2-3 已注销），不是待办 |
 
 ---
 
@@ -285,6 +294,9 @@ go run scripts/gen-fixtures.go -out ../harness_mobile/fixtures
 | Gradle 构建卡住不动 | 多套守护进程互锁 | `gradlew --stop` 或按 PID 终止旧 java 进程 |
 | `Unsupported class file major version 65` | Gradle 8.3 及以下在 JDK 21 上跑不了 | 保持 `gradle-wrapper.properties` 为 8.7（详见 `docs/环境搭建指南.md` §2 不变量 1/2） |
 | 覆盖安装提示「应用未安装」 | 签名不一致 | 卸载重装；**不要跨版本换签名** |
+| Windows 构建报 `NUGET-NOTFOUND ... Microsoft.Windows.ImplementationLibrary` | NuGet 只在**用户级** PATH，MSBuild 不继承 | NuGet 目录必须写入**系统级** PATH（`Machine`），并在构建时重新拼接环境变量；详见 `docs/环境搭建指南.md` Windows 桌面调试章节 |
+| Windows 构建报 `LNK2019/LNK2001 __std_find_last_trivial_1`（来自 `firebase_app.lib`） | `firebase_core` 包内藏着未声明 windows 平台的 C++ 实现 | 本项目已移除 firebase 依赖；若重新引入需按平台条件加载，勿让其进入 Windows 构建 |
+| Windows 桌面跑起来但指纹/相册不可用 | Windows 上 `local_auth` 走 Windows Hello、`image_picker` 走文件选择器，语义与手机不同 | 属设计内差异，这三项能力必须回 Android/iOS 真机验证 |
 
 ---
 
@@ -292,5 +304,6 @@ go run scripts/gen-fixtures.go -out ../harness_mobile/fixtures
 
 | 日期 | 变更 |
 | --- | --- |
-| 2026-11 | **批次 C 架构收口（提交 `15767d3`）**：产品定位改为「纯 WebView 主体 + 原生身份链路」；删除 `features/{approval,session,delivery}`、`domain/repositories/approval_repository.dart`、`data/remote/{approval,session,delivery}_api.dart`、`data/ws/sse_client.dart` 与对应路由（`AppRoutes` 只剩 splash/setup/pairing/login/webview/account）；新增 `core/app/webview_lock.dart`（App 级生物识别解锁门）、`data/remote/webview_ticket_api.dart`（一次性票据透传）、`data/remote/workspace_api.dart`（工作空间只读）；深链白名单 `approval` → `reauth`；随后 `4f2bfd3` 补工作空间只读 API。构建链升级为 **JDK 21 + Gradle 8.7 + AGP 8.6.1**。`lib/` 收敛到 28 文件、`test/` 11 文件（170 用例） |
+| 2026-11 | **WebView 迁移到 `flutter_inappwebview`（提交 `009e3ea`），打通 Windows 桌面调试**：`webview_flutter` → `flutter_inappwebview ^6.1.5`（后者支持 Windows/WebView2，前者无任何 Windows 路径）；新增 `windows/` 平台骨架（18 个构建源文件）；移除 `firebase_messaging`/`firebase_core`（其包内藏着未声明 windows 的 C++ 实现，会链 `firebase_cpp_sdk` 失败，实测 `lib/`·`test/`·`android/` 三处零引用）。迁移中补齐了**原先并不存在**的「首帧注入只做一次」标记 `_bridgeInjected`（因 `onPageFinished` → `onLoadStop` 在 SPA 内部导航时会重复触发）。实测 `analyze` 零问题、`test` **182 用例**全绿、`build windows --debug` 成功（0.6MB / 实跑 367MB）。⚠️ Android 真机未复验 |
+| 2026-11 | **批次 C 架构收口（提交 `15767d3`）**：产品定位改为「纯 WebView 主体 + 原生身份链路」；删除 `features/{approval,session,delivery}`、`domain/repositories/approval_repository.dart`、`data/remote/{approval,session,delivery}_api.dart`、`data/ws/sse_client.dart` 与对应路由（`AppRoutes` 只剩 splash/setup/pairing/login/webview/account）；新增 `core/app/webview_lock.dart`（App 级生物识别解锁门）、`data/remote/webview_ticket_api.dart`（一次性票据透传）、`data/remote/workspace_api.dart`（工作空间只读）；深链白名单 `approval` → `reauth`；随后 `4f2bfd3` 补工作空间只读 API。构建链升级为 **JDK 21 + Gradle 8.7 + AGP 8.6.1**。`lib/` 收敛到 28 文件、`test/` 11 文件（170 用例）。<br>⚠️ 后续核算修正：批次 C 之后 `lib/` 实为 **29** 文件（原文 28 少计 1），整体为 `app.dart` 与 `core/app/` 下 5 件并存所致；测试用例数同期为 182 而非 170 |
 | 2026-11 | MM1（配对/登录/审批中心/WS/会话）+ 批次 1（WebView/JS 桥/上架材料）+ 批次 2-1（相册投递）交付；端到端联调通过；`analyze` 零问题 + 当时基线 162 测试全绿（其中审批中心/会话/投递相关用例已随批次 C 删除） |
