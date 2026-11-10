@@ -12,13 +12,17 @@ android {
     compileSdk = 35
     ndkVersion = flutter.ndkVersion
 
+    // Java 17：与 Gradle 8.7 / AGP 8.6.1 / Kotlin 1.9.24 构建链对齐（JDK 21 运行）。
+    // 原为 VERSION_1_8，在 JDK 21 的 javac 下会刷 "source value 8 is obsolete" 警告。
+    // ⚠️ sourceCompatibility / targetCompatibility 与 kotlinOptions.jvmTarget 必须同值，
+    //    否则报 "Inconsistent JVM-target compatibility detected"。
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_1_8
+        jvmTarget = JavaVersion.VERSION_17
     }
 
     defaultConfig {

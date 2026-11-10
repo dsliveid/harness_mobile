@@ -1,12 +1,16 @@
-/// WebView 桥与全功能视图的出口门禁测试。
+/// WebView 桥与全功能视图的出口门禁测试（批次 C：WebView 主体架构）。
 ///
 /// 覆盖交接书的四条硬约束：
 /// 1. **R3（不注入令牌）**：注入页面的脚本里绝不能出现任何令牌字段
 ///    （`device_token` / `deviceToken` / `user_token` / `access_token`）。
-/// 2. 桥只暴露 `harnessMobile.version` + `openDeepLink` 两个能力。
-/// 3. 深链严格白名单：只认 `harness://approval/<id>` 与 `harness://session/<id>`，
-///    其它（含 https、未知类型、缺 id）一律 null。
+/// 2. 桥只暴露 `harnessMobile` 能力声明 + `openDeepLink`。
+/// 3. 深链严格白名单：只认 `harness://session/<id>` 与 `harness://reauth`，
+///    其它（含 https、`harness://approval/...`、未知类型、缺 id）一律 null。
 /// 4. **版本协商不白屏**：加载失败 → 可读错误 + 重试；baseUrl 为空 → 空态文案。
+///
+/// 批次 C 变更：审批中心已删除，深链白名单同步去掉 `approval`、新增 `reauth`；
+/// 原 `DeepLinkKind.approval` 的用例改写为「approval 必须被拒」的否定断言，
+/// 并补上 reauth 的正向断言（覆盖率不降反升）。
 library;
 
 import 'dart:typed_data';
@@ -186,11 +190,12 @@ void main() {
   });
 
   group('parseDeepLink（白名单深链）', () {
-    test('harness://approval/abc → approval + abc', () {
-      final intent = parseDeepLink('harness://approval/abc');
+    test('harness://reauth → reauth（Cookie 失效时请求原生重签）', () {
+      final intent = parseDeepLink('harness://reauth');
       expect(intent, isNotNull);
-      expect(intent!.kind, DeepLinkKind.approval);
-      expect(intent.id, 'abc');
+      expect(intent!.kind, DeepLinkKind.reauth);
+      // reauth 无目标对象，id 必须是空串（不可伪造一个假 id 诱导端侧行为）
+      expect(intent.id, '');
     });
 
     test('harness://session/xyz → session + xyz', () {
@@ -208,26 +213,38 @@ void main() {
       expect(parseDeepLink('harness://unknown/x'), isNull);
     });
 
-    test('缺 id / 空串 / 非 URL 一律 null', () {
+    test('已删除的 harness://approval/<id> 必须被拒（批次 C 收窄白名单）', () {
+      // 审批中心已删除，页面若还发 approval 深链说明 Web 端未同步升级，
+      // 端侧必须拒绝而不是"尽力处理"，否则会给用户假的功能入口。
+      expect(parseDeepLink('harness://approval/abc'), isNull);
       expect(parseDeepLink('harness://approval'), isNull);
-      expect(parseDeepLink('harness://approval/'), isNull);
+    });
+
+    test('缺 id / 空串 / 非 URL 一律 null', () {
       expect(parseDeepLink('harness://session'), isNull);
+      expect(parseDeepLink('harness://session/'), isNull);
       expect(parseDeepLink(''), isNull);
       expect(parseDeepLink('   '), isNull);
       expect(parseDeepLink('not a url'), isNull);
     });
 
     test('大小写与尾部斜杠容忍', () {
-      final intent = parseDeepLink('HARNESS://APPROVAL/evt-9');
+      final intent = parseDeepLink('HARNESS://SESSION/evt-9');
       expect(intent, isNotNull);
-      expect(intent!.kind, DeepLinkKind.approval);
+      expect(intent!.kind, DeepLinkKind.session);
       expect(intent.id, 'evt-9');
+    });
+
+    test('reauth 大小写容忍（Host 归一化）', () {
+      final intent = parseDeepLink('HARNESS://REAUTH');
+      expect(intent, isNotNull);
+      expect(intent!.kind, DeepLinkKind.reauth);
     });
 
     test('javascript: / file: 等危险 scheme 被拒', () {
       expect(parseDeepLink('javascript:alert(1)'), isNull);
       expect(parseDeepLink('file:///etc/passwd'), isNull);
-      expect(parseDeepLink('intent://approval/x'), isNull);
+      expect(parseDeepLink('intent://session/x'), isNull);
     });
   });
 
@@ -319,6 +336,34 @@ void main() {
       // 未知深链：拦截但不派发
       expect(handler(Uri.parse('harness://unknown/x')), isFalse);
       expect(captured.length, 1);
+    });
+
+    testWidgets('未注入 onDeepLink 时 session 深链不崩溃且不丢弃意图（页面内定位）',
+        (WidgetTester tester) async {
+      // 批次 C 回归守护：默认分发路径曾引用已删除的会话路由与已注销的审批深链枚举。
+      // 修复后默认路径必须：① 拦截深链；② 不跳任何原生页面；③ 记住意图并在
+      // 页面就绪后消费（刷新 Web 工作区），绝不静默丢弃。
+      final factory = _FakeWebViewFactory();
+      final container = await _pumpWebView(
+        tester,
+        baseUrl: 'http://localhost:8080',
+        factory: factory,
+      );
+      expect(container, isNotNull);
+
+      final handler = factory.navigationHandler;
+      expect(handler, isNotNull);
+      expect(handler!(Uri.parse('harness://session/sess-99')), isFalse);
+
+      await tester.pump();
+      await tester.pump();
+
+      // 页面仍是 WebView 主体（没有 push 任何原生会话页）
+      expect(find.byType(WebViewPage), findsOneWidget);
+      expect(find.text('全功能视图'), findsOneWidget);
+      // 意图被消费：reload 至少被触发一次（即「在 WebView 内定位」的现有能力）
+      expect(factory.view!.reloadCount, greaterThanOrEqualTo(1));
+      expect(tester.takeException(), isNull);
     });
   });
 

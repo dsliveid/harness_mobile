@@ -13,7 +13,6 @@
 /// - 不改变 R3：令牌仍在 Keychain，本锁不参与任何密钥派生。
 library;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
 import 'biometric_gate.dart';
@@ -86,12 +85,31 @@ class WebViewLock extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   /// 请求解锁。fail-closed：拿不到结果即保持锁定。
+  ///
+  /// 三条保证：
+  /// 1. 闸门返回 false / 抛异常 → 状态**必定**回到 [WebViewLockState.locked]，
+  ///    绝不进入 unlocked；
+  /// 2. 异常路径会先回滚状态并 notifyListeners，再原样上抛 ——
+  ///    若只上抛不回滚，`_state` 会永久停在 [WebViewLockState.authenticating]，
+  ///    而本方法首行会因此拒掉之后每一次解锁，用户被硬锁死在门外且按钮永久转圈；
+  ///    回滚 + 上抛的组合既保证状态机自愈，也让调用方（锁屏 UI）能收到异常
+  ///    并给出可读提示，不做静默吞掉。
   Future<bool> unlock({String reason = '请验证指纹或面容以进入工作区'}) async {
     if (_state == WebViewLockState.authenticating) return false;
     _state = WebViewLockState.authenticating;
     notifyListeners();
 
-    final ok = await _gate.authenticate(reason: reason);
+    final bool ok;
+    try {
+      ok = await _gate.authenticate(reason: reason);
+    } on Object {
+      // 插件崩溃 / PlatformException / 用户取消异常：先回滚到 locked
+      // （fail-closed），通知监听者让 UI 停止转圈，再把异常交给调用方。
+      _state = WebViewLockState.locked;
+      notifyListeners();
+      rethrow;
+    }
+
     _state = ok ? WebViewLockState.unlocked : WebViewLockState.locked;
     notifyListeners();
     return ok;

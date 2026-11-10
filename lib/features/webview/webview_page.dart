@@ -12,6 +12,8 @@
 ///    [parseDeepLink] 白名单解析，原生→页面不存在反向通道。
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -178,6 +180,12 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
   String? _error;
   bool _loading = true;
 
+  /// 待定位的会话 id（`harness://session/<sid>` 深链暂存）。
+  ///
+  /// 首帧未就绪时深链可能先到，直接丢弃会让「推送点开会话」功能静默失效；
+  /// 因此暂存意图，待 `onPageFinished` 后由 [_consumePendingSession] 消费。
+  String? _pendingSessionId;
+
   @override
   void dispose() {
     _webView?.dispose();
@@ -278,6 +286,8 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
             _loading = false;
             _error = null;
           });
+          // 页面就绪：消费首帧前暂存的会话定位意图。
+          _consumePendingSession();
         },
         onLoadFailed: (String message) {
           if (!mounted) return;
@@ -316,6 +326,22 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
     return false;
   }
 
+  /// 深链派发（批次 C：白名单只剩 `session` / `reauth` 两类）。
+  ///
+  /// 架构铁律：**会话不再有原生页面**，因此这里绝不 `context.push` 任何会话路由
+  /// （会话消息 / 会话列表 / 审批中心 / 投递四个原生路由常量均已随批次 C 删除，
+  /// 复活其中任何一个都等于架构回退）。会话深链落成「在 WebView 内定位」。
+  ///
+  /// 定位机制与其诚实边界（实测核准，勿按想象改）：
+  /// - 服务端 SPA 只注册了 `GET /{$}` 与 `GET /login` 两个入口
+  ///   （harness_go `internal/api/router.go`），`static.go` 的 serveStatic 没有
+  ///   SPA fallback，请求 `/sessions/<id>` 会**直接 404**；
+  /// - `web/src` 也没有会话级 URL 路由（全仓仅 `LoginPage.tsx` 读
+  ///   `window.location.search`），Web UI 是内存 store 内切会话；
+  /// - [MobileWebView] 当前也不提供实例创建后的 `loadRequest` 能力。
+  ///
+  /// 因此端侧**无法**凭空把 Web 页面导航到某个会话；正确做法是
+  /// 「待定位意图暂存 + 页面就绪后消费」，绝不静默丢弃意图。
   void _dispatchDeepLink(DeepLinkIntent intent) {
     final handler = widget.onDeepLink;
     if (handler != null) {
@@ -324,10 +350,54 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
     }
     switch (intent.kind) {
       case DeepLinkKind.session:
-        context.push(AppRoutes.sessionMessages(intent.id));
-      case DeepLinkKind.approval:
-        // 审批详情没有独立路由（首屏即审批中心），提示用户回列表定位。
-        _toast('已定位审批项：${intent.id}，请在审批中心查看');
+        _pendingSessionId = intent.id;
+        if (_error == null && !_loading && _webView != null) {
+          _consumePendingSession();
+        } else {
+          // 首帧未就绪：先记住意图，等 onPageFinished 回来再消费。
+          _toast('已记录要打开的会话，页面就绪后为你定位');
+        }
+      case DeepLinkKind.reauth:
+        // 语义：Cookie 失效 → 回原生重签一次性 ticket（复用已有签发能力），
+        // 拿不到票时 fail-closed 提示回登录，不给静默放行、不伪造凭据。
+        unawaited(_handleReauthDeepLink());
+    }
+  }
+
+  /// 消费暂存的会话定位意图。
+  ///
+  /// 现阶段 Web UI 无会话级 URL 路由，端侧只能把页面刷新到工作区最新状态
+  /// （`reload` 是 [MobileWebView] 已有的唯一导航能力）并明确告知用户目标
+  /// 会话 id，由用户在 Web 工作区内确认。**不假装已定位成功**。
+  void _consumePendingSession() {
+    final sid = _pendingSessionId;
+    if (sid == null || sid.isEmpty) return;
+    _pendingSessionId = null;
+    unawaited(_reload(_webView));
+    _toast('已刷新 Web 工作区，请在其中打开会话 $sid');
+  }
+
+  /// `harness://reauth`：用已有 [WebViewTicketApi.issue] 重签一次性 ticket。
+  Future<void> _handleReauthDeepLink() async {
+    final services = servicesOf(ref);
+    final deviceId = ref.read(appSessionProvider).deviceId;
+    if (services == null || deviceId.isEmpty) {
+      _toast('登录已失效，请回账号页重新登录');
+      return;
+    }
+    try {
+      final ticket = await services.webviewTicket.issue(deviceId: deviceId);
+      if (!mounted) return;
+      if (ticket.isEmpty) {
+        _toast('凭据重签未返回票据，请回账号页重新登录');
+        return;
+      }
+      _toast('凭据已重签，正在刷新 Web 工作区');
+      await _reload(_webView);
+    } on Object {
+      // 服务端端点未接线 / 网络异常 / 未授权：一律安全降级为「回原生登录」。
+      if (!mounted) return;
+      _toast('凭据重签失败，请回账号页重新登录');
     }
   }
 

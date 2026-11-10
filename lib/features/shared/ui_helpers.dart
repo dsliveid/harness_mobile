@@ -195,10 +195,11 @@ class RiskChip extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
       decoration: BoxDecoration(
-        // Flutter 3.24 尚无 Color.withValues（3.27 才引入），此处用 withOpacity
-        color: color.withOpacity(0.12),
+        // Flutter 3.27+ 已提供 Color.withValues（本项目基线为 3.47.9）；
+        // withOpacity 自 3.27 起标记 deprecated，`--fatal-infos` 下算 error。
+        color: color.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: color.withOpacity(0.5)),
+        border: Border.all(color: color.withValues(alpha: 0.5)),
       ),
       child: Text(
         _labels[risk] ?? (risk.isEmpty ? '未知' : risk),

@@ -1,7 +1,7 @@
 ﻿/// 应用外壳与首屏路由测试。
 ///
 /// 覆盖交接书验收点：
-/// - 首屏铁律：身份齐备 → **审批中心**（不是占位页）
+/// - 首屏铁律：身份齐备 → **WebView 主体**（批次 C 起不再是审批中心）
 /// - 启动判定链：无地址 → 设置页；有地址未配对 → 配对页；已配对未登录 → 登录页
 /// - 无调试横幅
 ///
@@ -100,9 +100,15 @@ void main() {
       resolveStage(baseUrl: 'http://h:8080', paired: true, signedIn: false),
       AppStage.login,
     );
+    // 首屏铁律：三者齐备 → WebView 主体（批次 C 起不再是审批中心）
     expect(
       resolveStage(baseUrl: 'http://h:8080', paired: true, signedIn: true),
-      AppStage.approvals,
+      AppStage.webview,
+    );
+    // 否定断言：有地址但未配对时绝不能越级到 webview
+    expect(
+      resolveStage(baseUrl: 'http://h:8080', paired: false, signedIn: true),
+      AppStage.pairing,
     );
   });
 }

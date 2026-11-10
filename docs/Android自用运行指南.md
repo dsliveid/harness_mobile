@@ -31,6 +31,8 @@ D:\Software\flutter\bin\flutter.bat doctor
 
 重点看 `Android toolchain` 是否 ✅。若提示缺 Android SDK 或 JDK，需先安装。
 
+> 本项目构建链为 **Gradle 8.9 + AGP 8.7.2 + Kotlin 1.9.24**，配 **JDK 21** 使用（无需 JDK 17）。详见 `docs/环境搭建指南.md` §2.4。
+
 ### 1.2 确认服务端监听地址（关键）
 
 服务端监听地址决定**哪些运行环境能连上**。检查：
