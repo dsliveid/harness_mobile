@@ -63,8 +63,8 @@ ApiServices? servicesOf(WidgetRef ref) {
 
 /// WebView 会话 Cookie 写入端口（方案 B 降级路径，架构文档 §4.2）。
 ///
-/// 抽成 Provider 的理由：真实实现依赖 `webview_flutter` 平台插件
-/// （`WebViewCookieManager`），`flutter test` 的 Dart VM 里不可用；
+/// 抽成 Provider 的理由：真实实现依赖 `flutter_inappwebview` 平台插件
+/// （`CookieManager`），`flutter test` 的 Dart VM 里不可用；
 /// 测试通过 override 注入假实现来断言「Cookie 值必须只进 Cookie jar、
 /// 绝不能出现在 URL / 日志里」。
 final Provider<WebViewCookieSink> webViewCookieSinkProvider =

@@ -27,14 +27,22 @@ dependencies:
   path_provider: ^2.1.4
 
   # —— 推送与通知 ——
-  firebase_messaging: ^15.1.0
+  # 🔴 firebase_messaging / firebase_core 已移除（2026-11，迁移 Windows 调试时发现）：
+  #   firebase_core 虽未在 pubspec 声明 windows 平台，但其包内带有 windows/ C++ 实现，
+  #   Flutter 会自动把它编入 Windows 构建，随后因缺 firebase_cpp_sdk 导致
+  #   LNK2019/LNK2001（__std_find_last_trivial_1 等）链接失败。
+  #   实测 lib/ / test/ / android/ 三处对 firebase 均为零引用，移除不影响现有功能。
+  #   将来若要做推送（批次 4），需重新引入并在 Android 侧配 google-services.json；
+  #   Windows 端无 firebase 支持，届时需按平台条件加载。
   flutter_local_notifications: ^17.2.2
 
   # —— 设备能力 ——
   image_picker: ^1.1.2
   local_auth: ^2.3.0
   permission_handler: ^11.3.1
-  webview_flutter: ^4.9.0
+  # WebView：flutter_inappwebview 同时支持 Android / iOS / Windows（Windows 端
+  # 走 WebView2），使 Windows 桌面成为可用的调试目标；webview_flutter 无 Windows 实现。
+  flutter_inappwebview: ^6.1.5
   crypto: ^3.0.5
   uuid: ^4.5.0
 

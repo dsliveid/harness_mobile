@@ -23,9 +23,9 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:webview_flutter/webview_flutter.dart';
 
 import '../../core/app/api_services.dart';
 import '../../core/app/app_session.dart';
@@ -38,7 +38,7 @@ import 'js_bridge.dart';
 
 /// 内置浏览器抽象（**可注入**）。
 ///
-/// 存在理由：`webview_flutter` 在 `flutter test` 的 Dart VM 环境下无法创建
+/// 存在理由：`flutter_inappwebview` 在 `flutter test` 的 Dart VM 环境下无法创建
 /// 平台视图（会抛 MissingPluginException）。把「造视图 + 控制」抽成接口后，
 /// 页面逻辑（空态 / 错误态 / 深链拦截 / 桥注入）都能在纯 Dart 环境断言。
 abstract class WebViewFactory {
@@ -90,6 +90,14 @@ class PlatformWebViewFactory implements WebViewFactory {
       );
 }
 
+/// 生产实现的 [InAppWebView] 适配。
+///
+/// 与 `webview_flutter` 的**结构性差异**（迁移要点）：
+/// - 控制器不再能在构造期 `new` 出来，只能由 widget 的 `onWebViewCreated`
+///   回调交给端侧，因此 [_controller] 在首个帧渲染前恒为 `null`；
+/// - 导航回调全部挂在 **widget 上**（不再有 `NavigationDelegate` 对象）；
+/// - 首帧 URL 走 `initialUrlRequest`，**不**在构造期主动 `loadUrl`
+///   （平台视图尚未挂载时调用会抛异常）。
 class _PlatformWebView implements MobileWebView {
   _PlatformWebView({
     required Uri initialUrl,
@@ -98,65 +106,152 @@ class _PlatformWebView implements MobileWebView {
     required void Function(Uri url) onPageFinished,
     required void Function(String message) onLoadFailed,
     required bool Function(Uri url) onNavigationRequest,
-  }) {
-    _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setBackgroundColor(const Color(0xFFFFFFFF))
-      ..setNavigationDelegate(
-        NavigationDelegate(
-          onPageStarted: (String url) => onPageStarted(Uri.parse(url)),
-          onPageFinished: (String url) async {
+  })  : _initialUrlRequest = URLRequest(url: WebUri(initialUrl.toString())),
+        _bridgeScript = bridgeScript,
+        _onPageStarted = onPageStarted,
+        _onPageFinished = onPageFinished,
+        _onLoadFailed = onLoadFailed,
+        _onNavigationRequest = onNavigationRequest;
+
+  final URLRequest _initialUrlRequest;
+  final String _bridgeScript;
+  final void Function(Uri url) _onPageStarted;
+  final void Function(Uri url) _onPageFinished;
+  final void Function(String message) _onLoadFailed;
+  final bool Function(Uri url) _onNavigationRequest;
+
+  InAppWebViewController? _controller;
+
+  /// **不变量 1：桥注入一次性标记。**
+  ///
+  /// `onLoadStop`（对应原 `onPageFinished`）**不是**「首次加载完成」的同义词：
+  /// SPA 内部 `history.pushState` / 重定向在部分平台会让它重复触发。
+  /// 没有这个标记，桥脚本会在同一次文档里被反复 `evaluateJavascript`。
+  /// 复位点只有 [InAppWebView.onLoadStart]（顶层新文档开始）——
+  /// 新文档必须重新拿到桥，而 SPA 内部路由不产生新文档、不触发 `onLoadStart`。
+  bool _bridgeInjected = false;
+
+  /// widget 已卸载 / 实例已被页面丢弃：此后一律不再向外回调，
+  /// 避免已废弃的实例把旧状态写回页面（对应 `_generation` 语义）。
+  bool _disposed = false;
+
+  /// 设置对象**只建一次**：`InAppWebView` 每次收到新的 settings 实例都会
+  /// 向平台重推一遍设置，放在 `build` 里会产生无谓的跨平台往返。
+  final InAppWebViewSettings _settings = InAppWebViewSettings(
+    javaScriptEnabled: true,
+    // 显式打开：`shouldOverrideUrlLoading` 是深链白名单的唯一拦截点，
+    // 不能依赖「传了回调就自动推断为 true」的隐式行为。
+    useShouldOverrideUrlLoading: true,
+    transparentBackground: false,
+  );
+
+  @override
+  Widget build(BuildContext context) => InAppWebView(
+        initialUrlRequest: _initialUrlRequest,
+        initialSettings: _settings,
+        onWebViewCreated: (InAppWebViewController controller) {
+          _controller = controller;
+        },
+        onLoadStart: (InAppWebViewController _, WebUri? url) {
+          if (_disposed) return;
+          // 新文档开始 → 允许在新文档里重新注入一次桥（见 [_bridgeInjected]）。
+          _bridgeInjected = false;
+          if (url == null) return;
+          _onPageStarted(Uri.parse(url.toString()));
+        },
+        onLoadStop: (InAppWebViewController controller, WebUri? url) async {
+          if (_disposed) return;
+          if (!_bridgeInjected) {
+            // 先占位再注入：注入是异步的，期间若 onLoadStop 再次触发，
+            // 不能再发一份（否则同一页面并发注入两次）。
+            _bridgeInjected = true;
             // 页面就绪后才注入桥：过早注入会被后续文档加载冲掉。
             try {
-              await _controller.runJavaScript(bridgeScript);
+              await controller.evaluateJavascript(source: _bridgeScript);
             } catch (_) {
-              // 注入失败不影响页面可用性（只是页面拿不到 openDeepLink）
+              // **不变量 2**：注入失败只让页面拿不到 openDeepLink，
+              // 绝不升级成错误页 / 白屏（页面本身已可用）。
+              // 复位标记，让后续的 onLoadStop 还能补一次（桥脚本自身幂等，
+              // 重复调用不会污染页面）。
+              _bridgeInjected = false;
             }
-            onPageFinished(Uri.parse(url));
-          },
-          onWebResourceError: (WebResourceError error) {
-            // 子资源（favicon / 图片）失败不当作整页失败，避免误报错误页。
-            if (error.isForMainFrame == false) return;
-            onLoadFailed(
-              '页面加载失败：${error.description}'
-              '${error.errorCode == 0 ? '' : '（错误码 ${error.errorCode}）'}',
-            );
-          },
-          onHttpError: (HttpResponseError error) {
-            final code = error.response?.statusCode;
-            if (code == null) return;
-            if (code < 400) return;
-            onLoadFailed('服务端返回 $code，内置页面暂时不可用');
-          },
-          onNavigationRequest: (NavigationRequest request) {
-            final uri = Uri.tryParse(request.url);
-            if (uri == null) return NavigationDecision.prevent;
-            return onNavigationRequest(uri)
-                ? NavigationDecision.navigate
-                : NavigationDecision.prevent;
-          },
-        ),
-      )
-      ..loadRequest(initialUrl);
+            if (_disposed) return;
+          }
+          if (url == null) return;
+          _onPageFinished(Uri.parse(url.toString()));
+        },
+        onReceivedError: (
+          InAppWebViewController _,
+          WebResourceRequest request,
+          WebResourceError error,
+        ) {
+          if (_disposed) return;
+          // **不变量 3**：子资源（favicon / 图片）失败不当作整页失败。
+          // 判定与原 `webview_flutter` 实现**逐字保持等价**：只有明确的
+          // `isForMainFrame == false` 才忽略；`bool?` 为 null 时按「可能整页失败」
+          // 处理（宁可提示可读错误，也不静默白屏）。
+          if (request.isForMainFrame == false) return;
+          final type = error.type.toValue();
+          _onLoadFailed(
+            '页面加载失败：${error.description}'
+            '${type.isEmpty ? '' : '（$type）'}',
+          );
+        },
+        onReceivedHttpError: (
+          InAppWebViewController _,
+          WebResourceRequest request,
+          WebResourceResponse errorResponse,
+        ) {
+          if (_disposed) return;
+          // 同 [onReceivedError] 的「不变量 3」口径：只忽略明确的子资源错误。
+          if (request.isForMainFrame == false) return;
+          final code = errorResponse.statusCode;
+          if (code == null) return;
+          if (code < 400) return;
+          _onLoadFailed('服务端返回 $code，内置页面暂时不可用');
+        },
+        shouldOverrideUrlLoading: (
+          InAppWebViewController _,
+          NavigationAction navigationAction,
+        ) async {
+          if (_disposed) return NavigationActionPolicy.CANCEL;
+          final raw = navigationAction.request.url?.toString();
+          final uri = raw == null ? null : Uri.tryParse(raw);
+          if (uri == null) return NavigationActionPolicy.CANCEL;
+          return _onNavigationRequest(uri)
+              ? NavigationActionPolicy.ALLOW
+              : NavigationActionPolicy.CANCEL;
+        },
+      );
+
+  @override
+  Future<void> reload() async {
+    final controller = _controller;
+    if (controller == null) return;
+    await controller.reload();
   }
 
-  late final WebViewController _controller;
+  @override
+  Future<bool> canGoBack() async {
+    final controller = _controller;
+    if (controller == null) return false;
+    return controller.canGoBack();
+  }
 
   @override
-  Widget build(BuildContext context) => WebViewWidget(controller: _controller);
-
-  @override
-  Future<void> reload() => _controller.reload();
-
-  @override
-  Future<bool> canGoBack() => _controller.canGoBack();
-
-  @override
-  Future<void> goBack() => _controller.goBack();
+  Future<void> goBack() async {
+    final controller = _controller;
+    if (controller == null) return;
+    await controller.goBack();
+  }
 
   @override
   void dispose() {
-    // webview_flutter 无显式 dispose；平台视图随 widget 卸载回收。
+    // 平台侧 dispose 由 [InAppWebView] 的 State.dispose 统一负责
+    // （它会调用 `platform.dispose()`）；这里再调一次 `controller.dispose()`
+    // 会造成重复释放。只做「停止向外回调 + 断开引用」。
+    _disposed = true;
+    _controller = null;
   }
 }
 
