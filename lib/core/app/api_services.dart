@@ -15,6 +15,7 @@ import '../../data/remote/auth_api.dart';
 import '../../data/remote/device_api.dart';
 import '../../data/remote/http_client.dart';
 import '../../data/remote/webview_ticket_api.dart';
+import '../../data/remote/workspace_api.dart';
 
 /// 一套绑定某 baseUrl 的 API 客户端集合。
 class ApiServices {
@@ -51,6 +52,9 @@ class ApiServices {
     client: client,
     store: _store,
   );
+
+  /// 工作空间只读消费（移动端不建/不改/不删，见 workspace_api.dart 头注释）。
+  late final WorkspaceApi workspaces = WorkspaceApi(client: client);
 
   /// 探测服务端连通性（设置页「测试连接」按钮用）。
   ///
