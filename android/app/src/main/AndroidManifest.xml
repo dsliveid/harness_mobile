@@ -4,8 +4,6 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <!-- 相机：拍现场照片投递给 Agent（运行时会再次申请，用户可拒绝） -->
     <uses-permission android:name="android.permission.CAMERA"/>
-    <!-- 生物识别：高风险审批前二次确认 -->
-    <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
 
     <!-- 相机为可选能力：无相机设备也可安装使用（避免 Play 商店过滤掉平板） -->
     <uses-feature android:name="android.hardware.camera" android:required="false"/>

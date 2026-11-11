@@ -58,3 +58,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# JVM / Dart VM 崩溃日志（构建 OOM 残留，勿入库）
+hs_err_pid*.log
+replay_pid*.log

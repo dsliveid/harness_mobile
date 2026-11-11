@@ -99,9 +99,10 @@ CLEARTEXT communication to 192.168.1.10 not permitted by network security policy
 | `INTERNET` | 与服务端通信 | 必需 |
 | `ACCESS_NETWORK_STATE` | 网络状态判断 | 必需 |
 | `CAMERA` | 拍照投递 | 运行时申请 |
-| `USE_BIOMETRIC` | 高风险审批二次确认 | 运行时申请 |
 
 **注意**：**没有申请存储权限**，这是刻意的。Android 13+ 的 `image_picker` 走系统 Photo Picker（`ACTION_GET_CONTENT`），不需要 `READ_MEDIA_IMAGES`，用户体验也更好（只授权你选的那张图）。
+
+> 🔴 2026-11 变更：`USE_BIOMETRIC` 权限已移除（App 级生物识别解锁门下线）。当前 Manifest 只剩上表三项。
 
 ---
 

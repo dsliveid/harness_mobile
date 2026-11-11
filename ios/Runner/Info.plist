@@ -51,9 +51,6 @@
 	<!-- 相机：拍现场照片交给 Agent -->
 	<key>NSCameraUsageDescription</key>
 	<string>需要使用相机，以便把您拍摄的照片交给 Agent 处理</string>
-	<!-- 生物识别：高风险审批前二次确认 -->
-	<key>NSFaceIDUsageDescription</key>
-	<string>使用面容 ID 确认高风险审批操作，保护您的数据安全</string>
 	<!-- 深链：通知/WebView 唤起指定审批或会话 -->
 	<key>CFBundleURLTypes</key>
 	<array>
