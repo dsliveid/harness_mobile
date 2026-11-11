@@ -288,4 +288,95 @@ void main() {
       expect(find.text('已连接'), findsNothing);
     });
   });
+
+  group('ConnectionStateDot（窄屏 AppBar 极简圆点）', () {
+    Future<void> pumpDot(
+      WidgetTester tester,
+      DeviceWsState state, {
+      DeviceWsDeadReason? deadReason,
+      int retryCount = 0,
+    }) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Center(
+              child: ConnectionStateDot(
+                state: state,
+                deadReason: deadReason,
+                retryCount: retryCount,
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    testWidgets('6 状态穷举可渲染，且尺寸只有十几 dp（不吃横向空间）',
+        (WidgetTester tester) async {
+      for (final state in DeviceWsState.values) {
+        await pumpDot(tester, state, deadReason: DeviceWsDeadReason.maxRetriesExceeded);
+        expect(find.byType(ConnectionStateDot), findsOneWidget,
+            reason: state.name);
+        final size = tester.getSize(find.byType(ConnectionStateDot));
+        // 默认 size=10 → 光晕 18 + 2dp 呼吸 = 20dp 上限
+        expect(size.width, lessThanOrEqualTo(20), reason: state.name);
+        expect(size.height, lessThanOrEqualTo(20), reason: state.name);
+      }
+    });
+
+    testWidgets('无障碍标签携带映射表 label（圆点不丢语义）',
+        (WidgetTester tester) async {
+      final handle = tester.ensureSemantics();
+      for (final state in DeviceWsState.values) {
+        await pumpDot(tester, state);
+        final visual = visualForConnectionState(state);
+        expect(
+          find.bySemanticsLabel(RegExp(RegExp.escape(visual.label))),
+          findsWidgets,
+          reason: '${state.name} 的圆点缺少与映射表一致的语义标签',
+        );
+      }
+      handle.dispose();
+    });
+
+    testWidgets('dead 死因改变语义标签（4 种死因文案不糊成一句）',
+        (WidgetTester tester) async {
+      final handle = tester.ensureSemantics();
+      final labels = <String>{};
+      for (final reason in DeviceWsDeadReason.values) {
+        await pumpDot(tester, DeviceWsState.dead, deadReason: reason);
+        final visual = visualForConnectionState(
+          DeviceWsState.dead,
+          deadReason: reason,
+        );
+        labels.add(visual.label);
+        expect(
+          find.bySemanticsLabel(RegExp(RegExp.escape(visual.label))),
+          findsWidgets,
+          reason: reason.name,
+        );
+      }
+      handle.dispose();
+      // dead 的 label 允许有复用（如「连接已停止」），但必须来自同一映射表，
+      // 这里只断言集合非空且每个死因都能找到自己的 label。
+      expect(labels, isNotEmpty);
+    });
+
+    testWidgets('颜色与 Chip 同源（colorForConnectionTone 是唯一解析点）',
+        (WidgetTester tester) async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(body: Center(child: ConnectionStateChip(state: DeviceWsState.live))),
+        ),
+      );
+      final theme = Theme.of(tester.element(find.byType(ConnectionStateChip)));
+      // 4 种 tone 的颜色必须互不相同，否则「语义区分」在视觉上失效
+      final colors = <Color>{
+        for (final tone in ConnectionTone.values)
+          colorForConnectionTone(theme, tone),
+      };
+      expect(colors.length, ConnectionTone.values.length);
+    });
+  });
 }

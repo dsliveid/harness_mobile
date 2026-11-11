@@ -3,7 +3,9 @@
 /// 启动顺序（架构文档 §5.1 状态机）：
 /// 1. [AppSession.load] 读取安全存储中的 `device_token` / `user_token` 与 baseUrl
 /// 2. 无地址 → 设置页；有地址无设备 → 配对页；已配对未登录 → 登录页；
-///    二者齐全 → **审批中心（首屏铁律）**
+///    二者齐全 → **全功能视图（WebView 主体，首屏铁律）**
+///
+/// 注：App 级生物识别解锁门已于 2026-11 移除，进入首屏不再有额外验证环节。
 ///
 /// ⚠️ 必须包 [ProviderScope]：`HarnessMobileApp` 是 ConsumerStatefulWidget，
 /// 所有依赖（SecureStore / SettingsStore / ApiFactory / AppSession）都走 Riverpod。

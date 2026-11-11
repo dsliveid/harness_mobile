@@ -30,8 +30,9 @@ import 'package:go_router/go_router.dart';
 import '../../core/app/api_services.dart';
 import '../../core/app/app_session.dart';
 import '../../core/app/providers.dart';
-import '../../core/app/webview_lock.dart';
 import '../../data/remote/webview_ticket_api.dart';
+import '../../data/ws/device_ws.dart';
+import '../shared/connection_state_ui.dart';
 import '../shared/ui_helpers.dart';
 import '../shared/web_entry.dart';
 import 'js_bridge.dart';
@@ -292,15 +293,6 @@ class WebViewPage extends ConsumerStatefulWidget {
 const String kWebViewAuthFailedMessage = '无法为内置页面获取登录凭据：'
     '一次性票据（ticket）与 Cookie 注入两条路径都不可用。';
 
-/// 是否要把 [WebViewLock] 当作进入 WebView 的门（纯函数，便于单测）。
-///
-/// 设计要点（交接书任务 2 第 4 条）：
-/// 只有「身份齐备且即将进入 WebView 主体」（[AppStage.webview]）时才要求生物识别。
-/// 其余阶段即便本页被渲染出来（例如登出瞬间正在过渡、或测试里直接 pump 本页），
-/// 也**不得**把用户锁死在门口 —— 那些阶段还没有可保护的会话，锁上去只会
-/// 让用户看到一个永远点不开的解锁屏。
-bool shouldGateWebView(AppStage stage) => stage == AppStage.webview;
-
 class _WebViewPageState extends ConsumerState<WebViewPage> {
   MobileWebView? _webView;
 
@@ -325,9 +317,6 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
 
   bool _loading = true;
 
-  /// 解锁失败的提示（锁屏内联展示，比 SnackBar 更容易被用户看到与重试）。
-  String? _lockError;
-
   /// 待定位的会话 id（`harness://session/<sid>` 深链暂存）。
   ///
   /// 首帧未就绪时深链可能先到，直接丢弃会让「推送点开会话」功能静默失效；
@@ -347,14 +336,11 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
     final session = ref.watch(appSessionProvider);
     final baseUrl = session.baseUrl;
 
-    // App 级解锁门（批次 C-2）：`watch` 让 UI 随锁状态变化自动重建
-    // （回前台超时重锁由 WebViewLock 内部 observer 负责，这里只响应）。
-    final lock = ref.watch(webViewLockProvider);
-    final gated = shouldGateWebView(session.stage);
-
     if (baseUrl.isEmpty) {
       return Scaffold(
-        appBar: AppBar(title: const Text('全功能视图'), actions: _actions(null)),
+        // 引导页没有 WebView 可操作，故把「检查服务端地址」作为可见按钮保留：
+        // 这个分支的全部意义就是引导用户去填地址，不能只靠长按状态圆点。
+        appBar: _buildAppBar(view: null, showSettingsAction: true),
         body: const EmptyBody(
           icon: Icons.language_outlined,
           title: '请先配置服务端地址',
@@ -363,38 +349,11 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
       );
     }
 
-    // 未解锁 → 只渲染锁屏，**不创建** WebView（凭据不进内存也进不了页面）。
-    if (gated && lock.isLocked) {
-      // 已创建的实例若因重新加锁（回前台超时 / 手动锁定）而失去意义，
-      // 立刻丢弃，避免锁定期间页面仍持有已注入的凭据。
-      // 放在帧后执行：build 内不能产生副作用。
-      if (_webView != null || _createdFor != null) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) _dropWebView();
-        });
-      }
-      return Scaffold(
-        appBar: AppBar(
-          title: const Text('全功能视图'),
-          actions: _actions(null),
-        ),
-        body: _LockState(
-          authenticating: lock.state == WebViewLockState.authenticating,
-          error: _lockError,
-          onUnlock: _unlock,
-          onOpenAccount: () => context.push(AppRoutes.account),
-        ),
-      );
-    }
-
     _ensureWebView(baseUrl);
 
     final view = _webView;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('全功能视图'),
-        actions: _actions(view),
-      ),
+      appBar: _buildAppBar(view: view),
       body: Column(
         children: <Widget>[
           if (_loading && _error == null)
@@ -405,23 +364,182 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
     );
   }
 
-  List<Widget> _actions(MobileWebView? view) => <Widget>[
-        IconButton(
+  /// 工具栏高度（窄屏优化核心）。
+  ///
+  /// 为什么是 40 而不是 Material3 默认的 56：手机屏本身就是稀缺资源，
+  /// 而这 56dp 里原本只放了一行中文标题 + 几个图标；更关键的是**下方
+  /// 服务端 Web UI 自带一条 `h-12` 的 TopBar**，两层标题栏叠在同一屏顶部
+  /// 会吃掉约 130dp（小屏 640dp 高设备的 20%）。降到 40dp 后单屏多出
+  /// 约 40dp 正文空间。
+  ///
+  /// 40dp 低于 Material 建议的 48dp 触控区，因此**所有按钮必须**走
+  /// [_toolbarIcon] 的紧凑规格（36×36 触控区），否则会被裁切或溢出。
+  static const double _kToolbarHeight = 40;
+
+  /// 统一工具栏图标规格。
+  ///
+  /// 三个约束缺一不可：
+  /// - `visualDensity.compact`：压掉 M3 默认的内边距；
+  /// - `padding: zero`：IconButton 默认 8dp padding 会撑破 40dp 高；
+  /// - `constraints` 36×36：仍要大于 32dp 的可点下限，保证能点中。
+  Widget _toolbarIcon({
+    required String tooltip,
+    required IconData icon,
+    required VoidCallback? onPressed,
+  }) {
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: onPressed,
+      icon: Icon(icon, size: 20),
+      iconSize: 20,
+      visualDensity: VisualDensity.compact,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+    );
+  }
+
+  /// 低矮图标工具栏（替代默认 56dp 的 Material3 AppBar）。
+  ///
+  /// 保留 `AppBar` 而不自建 `Container` 的原因：状态栏 insets 由它免费处理，
+  /// 自建时极易漏掉 `MediaQuery.paddingOf(context).top` 导致内容被刘海遮挡。
+  PreferredSizeWidget _buildAppBar({
+    required MobileWebView? view,
+    bool showSettingsAction = false,
+  }) {
+    return AppBar(
+      toolbarHeight: _kToolbarHeight,
+      titleSpacing: 4,
+      // 标题文字换成小图标：中文「全功能视图」在 360dp 宽的机型上会和
+      // 右侧三个图标抢空间。语义不丢 —— tooltip 与无障碍标签都还在。
+      title: const Tooltip(
+        message: '全功能视图',
+        child: Icon(Icons.hub_outlined, size: 18),
+      ),
+      actions: <Widget>[
+        _buildWsIndicator(),
+        _toolbarIcon(
           tooltip: '后退',
+          icon: Icons.arrow_back,
           onPressed: view == null ? null : () => _goBack(view),
-          icon: const Icon(Icons.arrow_back),
         ),
-        IconButton(
+        _toolbarIcon(
           tooltip: '刷新',
+          icon: Icons.refresh,
           onPressed: view == null ? null : () => _reload(view),
-          icon: const Icon(Icons.refresh),
         ),
-        IconButton(
-          tooltip: '检查服务端地址',
-          onPressed: () => context.push(AppRoutes.setup),
-          icon: const Icon(Icons.settings_outlined),
+        if (showSettingsAction)
+          _toolbarIcon(
+            tooltip: '检查服务端地址',
+            icon: Icons.settings_outlined,
+            onPressed: () => context.push(AppRoutes.setup),
+          ),
+        const SizedBox(width: 4),
+      ],
+    );
+  }
+
+  /// 设备长连接状态指示器（极简圆点 + 长按查看详情）。
+  ///
+  /// 点击语义**与降高前完全一致**（不可回归）：
+  /// - `dead` + `repairPairing` / `replacedElsewhere` → 回账号页
+  ///   （令牌失效/被顶替，盲目重连只会 401）；
+  /// - 其他 `dead` → 手动重连（重试预算清零）；
+  /// - 非 `dead` → 无副作用（只展示，不制造“点了没反应”的假按钮）。
+  ///
+  /// 新增长按 → 详情 Sheet：中文 Chip 的文字信息不再常驻占用横向空间，
+  /// 但 detail / actionHint 这些排查关键信息不能丢，所以收进按需展开层，
+  /// 同时承接原「检查服务端地址」图标的入口。
+  Widget _buildWsIndicator() {
+    final ws = ref.watch(deviceWsControllerProvider);
+    return Tooltip(
+      message: '设备连接状态（长按查看详情）',
+      child: InkWell(
+        onTap: () {
+          if (ws.state != DeviceWsState.dead) return;
+          final reason = ws.deadReason;
+          if (reason == DeviceWsDeadReason.repairPairing ||
+              reason == DeviceWsDeadReason.replacedElsewhere) {
+            context.push(AppRoutes.account);
+            return;
+          }
+          unawaited(ws.reconnectNow());
+        },
+        onLongPress: _showConnectionSheet,
+        borderRadius: BorderRadius.circular(18),
+        child: SizedBox(
+          width: 36,
+          height: 36,
+          child: Center(
+            child: ConnectionStateDot(
+              state: ws.state,
+              deadReason: ws.deadReason,
+              retryCount: ws.retryCount,
+            ),
+          ),
         ),
-      ];
+      ),
+    );
+  }
+
+  /// 连接状态详情弹层（长按状态圆点触发）。
+  ///
+  /// 复用 [ConnectionStateChip] 的非紧凑态（全宽条，带 detail + actionHint），
+  /// 避免为“弹层里再写一份文案”制造第二套说法。
+  void _showConnectionSheet() {
+    final ws = ref.read(deviceWsControllerProvider);
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (BuildContext sheetContext) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: Text(
+                  '设备连接状态',
+                  style: Theme.of(sheetContext).textTheme.titleSmall,
+                ),
+              ),
+              ConnectionStateChip(
+                state: ws.state,
+                deadReason: ws.deadReason,
+                retryCount: ws.retryCount,
+                compact: false,
+              ),
+              const SizedBox(height: 8),
+              // 被从 AppBar 移除的「设置」入口在此承接：窄屏上少一个图标，
+              // 功能一个不少。
+              ListTile(
+                leading: const Icon(Icons.settings_outlined),
+                title: const Text('检查服务端地址'),
+                subtitle: const Text('修改地址后需要重新配对'),
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  context.push(AppRoutes.setup);
+                },
+              ),
+              if (ws.state == DeviceWsState.dead &&
+                  ws.deadReason != DeviceWsDeadReason.repairPairing &&
+                  ws.deadReason != DeviceWsDeadReason.replacedElsewhere)
+                ListTile(
+                  leading: const Icon(Icons.refresh),
+                  title: const Text('立即重连'),
+                  subtitle: const Text('重试次数上限已重置'),
+                  onTap: () {
+                    Navigator.of(sheetContext).pop();
+                    unawaited(ws.reconnectNow());
+                  },
+                ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
 
   Widget _buildBody(ThemeData theme, MobileWebView? view) {
     if (_error != null) {
@@ -435,36 +553,21 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
             _authBlocked ? () => context.push(AppRoutes.account) : null,
         authFailure: _authFailure,
         // M3：票据类失败额外给「重试票据申请」，一键重签而不必重走全链路。
-        onRetryTicket: _authBlocked && _authFailure != null
-            ? () => _reload(null)
-            : null,
+        //
+        // 但**设备绑定已被否定**（deviceSessionFailed）时不给这个按钮：
+        // 服务端已明确拒绝（401 吊销 / 403 归属未知），再签一次必然还是
+        // 同一个结论，按钮只会变成点了没反应的死路。这种失败唯一的出路
+        // 是「回账号页重新登录 / 重新配对」，即下面的 onOpenAccount。
+        onRetryTicket:
+            _authBlocked && (_authFailure?.ticketRetryHelps ?? false)
+                ? () => _reload(null)
+                : null,
       );
     }
     if (view == null) {
       return const LoadingBody(message: '正在准备内置页面…');
     }
     return view.build(context);
-  }
-
-  /// 请求解锁（fail-closed：拿不到结果即保持锁定）。
-  ///
-  /// [WebViewLock.unlock] 在闸门抛异常时会**先回滚 locked 再 rethrow**，
-  /// 因此这里必须 catch 住异常并给出可读提示，否则异常会冒到 framework
-  /// 变成红屏；回滚由状态机保证，UI 只需重建（watch 已订阅）。
-  Future<void> _unlock() async {
-    final lock = ref.read(webViewLockProvider);
-    setState(() => _lockError = null);
-    try {
-      final ok = await lock.unlock();
-      if (!mounted) return;
-      if (!ok) {
-        setState(() => _lockError = '身份验证未通过，请重试（不支持跳过验证）');
-      }
-    } on Object catch (error) {
-      if (!mounted) return;
-      // 状态已由状态机回滚到 locked，按钮可再次点击重试。
-      setState(() => _lockError = '解锁失败：${friendlyError(error)}，请重试');
-    }
   }
 
   /// 丢弃已创建的 WebView 并要求下次进入重新走认证。
@@ -694,6 +797,10 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
         // 语义：Cookie 失效 → 回原生重签一次性 ticket（复用已有签发能力），
         // 拿不到票时 fail-closed 提示回登录，不给静默放行、不伪造凭据。
         unawaited(_handleReauthDeepLink());
+      case DeepLinkKind.settings:
+        // 契约三（2026-11）：服务端 SPA「宿主设置」浮标 → 回原生设置页。
+        // 与 AppBar/弹层里的「检查服务端地址」是同一条路（push /setup）。
+        unawaited(context.push(AppRoutes.setup));
     }
   }
 
@@ -748,17 +855,6 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
       final baseUrl = ref.read(appSessionProvider).baseUrl;
       if (baseUrl.isEmpty) return;
       _dropWebView();
-      // 解锁门未过的状态下不发起认证：避免带着凭据去创建不该存在的实例。
-      final lock = ref.read(webViewLockProvider);
-      final stage = ref.read(appSessionProvider).stage;
-      if (shouldGateWebView(stage) && lock.isLocked) {
-        setState(() {
-          _loading = false;
-          _error = null;
-          _authBlocked = false;
-        });
-        return;
-      }
       _createdFor = baseUrl;
       final generation = ++_generation;
       unawaited(_createWebView(baseUrl, generation));
@@ -883,83 +979,6 @@ class _ErrorState extends StatelessWidget {
                     label: const Text('回账号页重新登录'),
                   ),
               ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// App 级解锁门（批次 C-2，架构文档 §4.7.1）。
-///
-/// 位置：身份齐备（[AppStage.webview]）且 [WebViewLock] 未解锁时**替代**整个
-/// WebView 主体渲染。三条铁律在 UI 层的体现：
-/// 1. **无跳过按钮**：只有「解锁」与「回账号页」，后者用于登出而不是绕过；
-/// 2. **fail-closed 可见**：闸门拒绝 / 抛异常都由页面 `_unlock` 转成可读文案
-///    内联展示，用户能看懂并重试，而不是看到一个永久转圈或红屏；
-/// 3. **验证中禁用按钮**：防止连点弹出多个系统验证框（状态机也会拒）。
-class _LockState extends StatelessWidget {
-  const _LockState({
-    required this.authenticating,
-    required this.error,
-    required this.onUnlock,
-    required this.onOpenAccount,
-  });
-
-  final bool authenticating;
-  final String? error;
-  final VoidCallback onUnlock;
-  final VoidCallback onOpenAccount;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            Icon(
-              Icons.fingerprint,
-              size: 56,
-              color: theme.colorScheme.primary,
-            ),
-            const SizedBox(height: 16),
-            Text('解锁后进入工作区', style: theme.textTheme.titleMedium),
-            const SizedBox(height: 6),
-            Text(
-              '为保护本机凭据，进入内置工作区前需要验证指纹或面容。',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.outline),
-            ),
-            if (error != null) ...<Widget>[
-              const SizedBox(height: 12),
-              Text(
-                error!,
-                textAlign: TextAlign.center,
-                style: theme.textTheme.bodySmall
-                    ?.copyWith(color: theme.colorScheme.error),
-              ),
-            ],
-            const SizedBox(height: 20),
-            FilledButton.icon(
-              onPressed: authenticating ? null : onUnlock,
-              icon: authenticating
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.lock_open),
-              label: Text(authenticating ? '正在验证…' : '解锁'),
-            ),
-            const SizedBox(height: 8),
-            TextButton(
-              onPressed: onOpenAccount,
-              child: const Text('回账号页'),
             ),
           ],
         ),

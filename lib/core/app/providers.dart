@@ -1,6 +1,6 @@
 /// 应用依赖注入（Riverpod 2.x Provider 图）。
 ///
-/// 只承载「全局单例」：安全存储、配置存储、生物识别闸门、API 工厂、会话状态。
+/// 只承载「全局单例」：安全存储、配置存储、API 工厂、会话状态。
 /// 页面内的列表/加载态用各自 StatefulWidget 局部状态管理，避免为一次性数据
 /// 造 AsyncNotifier 反而增加生命周期复杂度。
 library;
@@ -11,10 +11,11 @@ import '../../data/local/app_settings_store.dart';
 import '../../data/local/secure_store.dart';
 import '../../data/remote/webview_cookie_sink.dart';
 import '../../data/remote/webview_ticket_api.dart';
+import '../../data/ws/device_connection.dart';
+import '../../data/ws/websocket_device_connection.dart';
 import 'api_services.dart';
 import 'app_session.dart';
-import 'biometric_gate.dart';
-import 'webview_lock.dart';
+import 'device_ws_controller.dart';
 
 /// 安全存储（令牌，红线 R3）。
 final Provider<SecureStore> secureStoreProvider = Provider<SecureStore>(
@@ -25,10 +26,6 @@ final Provider<SecureStore> secureStoreProvider = Provider<SecureStore>(
 final Provider<SettingsStore> settingsStoreProvider = Provider<SettingsStore>(
   (Ref ref) => SecureSettingsStore(),
 );
-
-/// 生物识别闸门（高风险审批前置）。
-final Provider<BiometricGate> biometricGateProvider =
-    Provider<BiometricGate>((Ref ref) => LocalAuthBiometricGate());
 
 /// API 工厂（按 baseUrl 缓存实例）。
 final Provider<ApiFactory> apiFactoryProvider = Provider<ApiFactory>(
@@ -70,22 +67,42 @@ ApiServices? servicesOf(WidgetRef ref) {
 final Provider<WebViewCookieSink> webViewCookieSinkProvider =
     Provider<WebViewCookieSink>((Ref ref) => const PlatformWebViewCookieSink());
 
-/// App 级 WebView 解锁门（批次 C-2 / 架构文档 §4.7.1）。
+/// 设备长连接工厂（**仅供测试**覆盖；生产用 [WebSocketDeviceConnection]）。
+final Provider<DeviceConnectionFactory> deviceConnectionFactoryProvider =
+    Provider<DeviceConnectionFactory>(
+  (Ref ref) =>
+      (Uri endpoint) => WebSocketDeviceConnection(endpoint),
+);
+
+/// 设备长连接控制器（App 级单例）。
 ///
-/// 三条约定：
-/// 1. 闸门取 [biometricGateProvider]（生产为 `LocalAuthBiometricGate`，
-///    测试可 override 成 `AlwaysPass` / `AlwaysDeny`）；
-/// 2. 初始态是**锁定**（[WebViewLock] 的默认值，fail-closed），
-///    由页面按 `AppSession.stage` 决定「是否把锁当门用」——见
-///    `webview_page.dart` 的 `shouldGateWebView`；
-/// 3. 回前台重锁由 [WebViewLock] 内部 `WidgetsBindingObserver` 负责，
-///    这里只负责 `startObserving()`；销毁由 [ChangeNotifierProvider] 自己
-///    调用 `dispose()`（它已接管 ChangeNotifier 生命周期），
-///    ⚠️ **不能再写 `ref.onDispose(lock.dispose)`** —— 那会导致双重 dispose
-///    并在测试收尾时抛 `ChangeNotifier was used after being disposed`。
-final ChangeNotifierProvider<WebViewLock> webViewLockProvider =
-    ChangeNotifierProvider<WebViewLock>((Ref ref) {
-  final lock = WebViewLock(gate: ref.watch(biometricGateProvider));
-  lock.startObserving();
-  return lock;
+/// ## 为什么需要这一层（而不直接把 `DeviceWsClient` 放 Provider）
+/// `DeviceWsClient` 的 `deviceToken` 是**构造期**参数（会被编进 endpoint 的
+/// `?token=`），而令牌存在 Keychain 里必须 `await` 读取。Riverpod 的普通
+/// `Provider` 是同步的，直接在里面 await 会把整条链路异步化
+/// （变成 `FutureProvider` → 每个页面每次 build 都要处理 loading 态）。
+///
+/// 因此这里引入一个 `ChangeNotifier` 作为中介：
+/// - Provider 只负责同步构造控制器（不含令牌读取）；
+/// - 控制器内部在 `start()` 时**异步**读令牌、构造真实 client、启动连接；
+/// - UI 订阅本控制器即可拿到状态、并可在 `initState` 中 attach 生命周期桥。
+///
+/// ## 生命周期铁律（2026-11 用户决策）
+/// - **登出（`signOut`）不断开**：WS 绑定「这台设备被授权接入」，与
+///   「当前登录的是谁」正交。登出只清 user_token，device_token 仍在，
+///   连接继续跑（服务端据此仍能看到本设备在线）。
+/// - **解绑（`resetPairing`）必须断开**：device_token 已被 `clearAll()` 抹掉，
+///   继续重连只会持续 401 打满日志。由会话层显式调 [DeviceWsController.stop]。
+final ChangeNotifierProvider<DeviceWsController> deviceWsControllerProvider =
+    ChangeNotifierProvider<DeviceWsController>((Ref ref) {
+  final controller = DeviceWsController(
+    store: ref.watch(secureStoreProvider),
+    factory: ref.watch(deviceConnectionFactoryProvider),
+    session: ref.watch(appSessionProvider),
+  );
+  // ⚠️ ChangeNotifierProvider 已接管 dispose，**不要**再写
+  // `ref.onDispose(controller.dispose)`（会双 dispose 并抛
+  // `ChangeNotifier was used after being disposed`）。
+  return controller;
 });
+

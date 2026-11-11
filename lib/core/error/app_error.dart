@@ -48,6 +48,12 @@ abstract final class ErrorCode {
   static const String deviceProtocolMismatch = 'device.protocol_mismatch';
   static const String deviceDisabled = 'device.disabled';
 
+  /// 设备令牌有效但**归属账号未知**（配对码未携带授权用户，历史数据）。
+  ///
+  /// 端侧遇到此码时的正确动作是「回账号页重新登录」而不是「重新配对」：
+  /// 设备本身没坏，只是服务端不知道它属于谁，无从代签用户会话。
+  static const String deviceOwnerUnknown = 'device.owner_unknown';
+
   // —— 文件系统（移动端本期不申报 workspace.list，一般不会遇到）——
   static const String fsHostUnsupported = 'fs.host_unsupported';
   static const String fsHostOffline = 'fs.host_offline';

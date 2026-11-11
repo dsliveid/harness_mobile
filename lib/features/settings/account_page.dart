@@ -18,6 +18,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../core/app/app_session.dart';
+import '../../core/app/device_unbind.dart';
 import '../../core/app/providers.dart';
 import '../../data/remote/auth_api.dart';
 import '../shared/ui_helpers.dart';
@@ -96,7 +97,7 @@ class _AccountPageState extends ConsumerState<AccountPage> {
           ListTile(
             leading: const Icon(Icons.phonelink_erase_outlined),
             title: const Text('解除本机绑定'),
-            subtitle: const Text('清除设备身份与本地凭据，需要重新配对'),
+            subtitle: const Text('清除设备身份与全部本地凭据，解绑会同时退出登录'),
             trailing: const Icon(Icons.chevron_right),
             enabled: !_busy,
             onTap: _confirmResetPairing,
@@ -263,16 +264,25 @@ class _AccountPageState extends ConsumerState<AccountPage> {
   Future<void> _confirmResetPairing() async {
     final ok = await _confirm(
       title: '解除本机绑定？',
-      message: '将清除设备身份与全部本地凭据，之后需要重新配对才能继续使用。',
+      // 断言的实现事实：resetPairing() 内部调 clearAll()，设备令牌与用户
+      // 令牌一起被抹掉 → 解绑**必然**同时退出登录。文案必须诚实告知，
+      // 否则用户会以为解绑后还能保持登录态。
+      message: '将清除设备身份与全部本地凭据（包括登录令牌，解绑会同时退出登录），'
+          '之后需要重新配对才能继续使用。',
       confirmText: '解除绑定',
     );
     if (!ok) return;
 
+    bool notified = true;
     await _runBusy(() async {
-      final session = ref.read(appSessionProvider);
-      await session.resetPairing();
-      await ref.read(secureStoreProvider).clearAll();
-    }, successText: '已解除本机绑定');
+      // 🔴 顺序：**先通知服务端**（unpair 的凭据就是 device_token，一旦
+      // 清本地就再也拿不到），再按既有顺序停 WS → 清 Cookie → 清令牌。
+      // unpair 失败不阻断本地解绑（本地凭据一清，用户意图即达成），
+      // 只把提示文案降级为「未能通知服务端」。
+      notified = await unbindThisDevice(ref);
+    }, successText: () => notified
+        ? '已解除本机绑定'
+        : '已解除本机绑定，但未能通知服务端');
   }
 
   Future<void> _confirmSignOut() async {
@@ -293,8 +303,12 @@ class _AccountPageState extends ConsumerState<AccountPage> {
           // 忽略：本地令牌由 session.signOut 统一清除
         }
       }
+      // 登出同样要清 WebView Cookie：否则 Web UI 仍带着上一个账号的会话，
+      // 而原生侧已显示「未登录」，两侧状态不一致。
+      await ref.read(webViewCookieSinkProvider).clearSessionCookies();
+      // signOut 只清 user_token，保留 device_token（设备绑定与长连接不受影响）。
       await ref.read(appSessionProvider).signOut();
-    }, successText: '已退出登录');
+    }, successText: () => '已退出登录');
   }
 
   Future<bool> _confirm({
@@ -322,16 +336,21 @@ class _AccountPageState extends ConsumerState<AccountPage> {
     return result ?? false;
   }
 
+  /// 统一执行一次危险操作。
+  ///
+  /// [successText] 刻意支持**回调**而不只是字符串：解绑的提示文案取决于
+  /// 「有没有成功通知服务端」（成功 → 「已解除本机绑定」；失败 → 追加
+  /// 「但未能通知服务端」）。文案必须诚实，绝不能两种情况都报同一句。
   Future<void> _runBusy(
     Future<void> Function() action, {
-    required String successText,
+    required String Function() successText,
   }) async {
     setState(() => _busy = true);
     try {
       await action();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(successText)),
+        SnackBar(content: Text(successText())),
       );
       final router = GoRouter.maybeOf(context);
       // 身份已变 → 由 app.dart 的 redirect 重新裁决落点；无路由上下文时不强跳。

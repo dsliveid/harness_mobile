@@ -9,7 +9,10 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
+import '../../core/app/app_session.dart';
+import '../../core/app/device_unbind.dart';
 import '../../core/app/providers.dart';
 import '../../core/config/base_url.dart';
 import '../shared/ui_helpers.dart';
@@ -51,10 +54,31 @@ class _SetupPageState extends ConsumerState<SetupPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('已保存服务端地址：$normalized')),
       );
+      _continueAfterSave();
     } on ArgumentError {
       // saveBaseUrl 的非法地址兜底（validate 已拦一层，这里防手动绕过）
       _showError('服务端地址不合法');
     }
+  }
+
+  /// 保存成功后推进到「当前阶段」对应的页面（**必须显式导航**，不能只靠 redirect）。
+  ///
+  /// 为什么不能依赖 go_router 的 redirect 自动跳转：
+  /// `app.dart` 里有一条 `location == /setup && target != /setup → return null`
+  /// 的白名单，它的职责是「已配对用户从 WebView/配对页 push 进来改地址时，
+  /// 不要被立刻弹回」——但它同时也会让「保存成功应当前进」失效，
+  /// 用户点完「保存并继续」就停在原页（真机实测踩中）。
+  ///
+  /// 为什么统一用 `go(target)` 而不用「canPop 就 pop」：
+  /// 实测在 `await` 之后再 `context.pop()` 存在「栈没变、页面没动」的失败场景
+  /// （refreshListenable 已因 baseUrl 变化重建过一次导航栈），
+  /// 而 `go(target)` 的目标由阶段唯一决定，对两种入口都正确：
+  /// - 启动即落在 /setup（入口态）→ 前进到 /pairing；
+  /// - 从 /webview 或 /pairing push 进来 → 回到那两页本身，效果与 pop 相同。
+  void _continueAfterSave() {
+    final target = pathOfStage(ref.read(appSessionProvider).stage);
+    if (target == AppRoutes.setup) return; // 理论上不可达：已保存地址必不为 setup
+    context.go(target);
   }
 
   Future<void> _testConnection() async {
@@ -223,9 +247,15 @@ class _SetupPageState extends ConsumerState<SetupPage> {
               const SizedBox(height: 12),
               OutlinedButton.icon(
                 onPressed: () async {
-                  await ref.read(appSessionProvider).resetPairing();
+                  // 与账号页 / 登录页共用同一套解绑流程：先通知服务端
+                  // （凭 device_token），再停 WS → 清 Cookie → 清令牌。
+                  final notified = await unbindThisDevice(ref);
                   if (!mounted) return;
-                  _showError('已解绑本机设备，请重新配对');
+                  _showError(
+                    notified
+                        ? '已解绑本机设备，请重新配对'
+                        : '已解绑本机设备，但未能通知服务端，请重新配对',
+                  );
                 },
                 icon: const Icon(Icons.link_off),
                 label: const Text('解绑本机设备'),

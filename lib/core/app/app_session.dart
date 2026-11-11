@@ -158,20 +158,44 @@ class AppSession extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 记录登录成功（user_token 已由 AuthApi 写入 Keychain）。
+  /// 记录登录成功（user_token 已由 AuthApi / DeviceApi 写入 Keychain）。
+  ///
+  /// 两条入口共用：表单登录（[AuthApi.login]）与「配对即登录」
+  /// （[DeviceApi.pair] 一并下发 user_token）。本方法**不写令牌**，
+  /// 只把「已登录」的事实翻成 true，令牌始终只在 `SecureStore`（红线 R3）。
   Future<void> markSignedIn() async {
     _signedIn = true;
     notifyListeners();
   }
 
-  /// 登出：清空用户令牌与本机设备身份视图，回到配对页。
+  /// 登出：只清**用户令牌**，保留设备令牌与设备绑定视图，回到登录页。
+  ///
+  /// 🔴 语义铁律（2026-11 修正，勿回退）：
+  /// 配对（这台机器被授权接入）与登录（这个人是谁）是**正交**的两件事：
+  /// - `device_token` 证明「本机被授权接入」，长期有效，是设备长连接
+  ///   （`/api/v1/devices/ws`）的唯一凭据；
+  /// - `user_token` 证明「当前登录的是谁」，登出即撤销。
+  ///
+  /// 因此本方法**只调 `deleteUserToken()`**，绝不再用 `clearAll()`：
+  /// 旧实现调 `clearAll()` 会连 `device_token` 一并抹掉，而 [paired] 只读
+  /// `_deviceId`（Settings 里的非机密字段），于是产生「UI 说已配对、
+  /// Keychain 里没有令牌」的不一致死局 —— 服务端没有任何端点能重新下发
+  /// `device_token`（只有消费新配对码的 `POST /devices/pair`），
+  /// 用户登出一次就必须回桌面端重新生成配对码，与本文档承诺完全相反。
+  ///
+  /// 若确实要连设备身份一起清掉（换机 / 设备被吊销），那是
+  /// [resetPairing]，不是本方法。
   Future<void> signOut() async {
-    await _tokens.clearAll();
+    await _tokens.deleteUserToken();
     _signedIn = false;
     notifyListeners();
   }
 
   /// 解绑设备（设备被吊销 / 用户主动重置）。
+  ///
+  /// 与 [signOut] 的区别：这里**同时**清空设备身份并落盘，[stage] 回到
+  /// [AppStage.pairing]；且 `clearAll()` 会一并清掉用户令牌，因此解绑
+  /// 必然导致「未登录」—— 这正是账号页确认文案要提示用户的事实。
   Future<void> resetPairing() async {
     await _tokens.clearAll();
     _signedIn = false;

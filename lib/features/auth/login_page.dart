@@ -13,6 +13,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../core/app/app_session.dart';
+import '../../core/app/device_unbind.dart';
 import '../../core/app/providers.dart';
 import '../../core/error/app_error.dart';
 import '../shared/ui_helpers.dart';
@@ -169,9 +170,18 @@ class _LoginPageState extends ConsumerState<LoginPage> {
             OutlinedButton.icon(
               onPressed: () async {
                 final messenger = ScaffoldMessenger.of(context);
-                await ref.read(appSessionProvider).resetPairing();
+                // 统一解绑流程：先通知服务端（要 device_token），再按
+                // 「停 WS → 清 Cookie → resetPairing → clearAll」清本地。
+                // 失败不阻断本地解绑，只降级提示文案。
+                final notified = await unbindThisDevice(ref);
                 messenger.showSnackBar(
-                  const SnackBar(content: Text('已解绑设备，请重新配对')),
+                  SnackBar(
+                    content: Text(
+                      notified
+                          ? '已解绑设备，请重新配对'
+                          : '已解绑设备，但未能通知服务端，请重新配对',
+                    ),
+                  ),
                 );
               },
               icon: const Icon(Icons.link_off),

@@ -115,9 +115,10 @@ void main() {
       final container = await _pumpApp(tester);
       // 阶段是唯一事实来源
       expect(container.read(appSessionProvider).stage, AppStage.webview);
-      // 首屏必须真的是 WebViewPage（AppBar 标题「全功能视图」）
+      // 首屏必须真的是 WebViewPage。标题栏降高后中文标题改为图标 + tooltip
+      // 承载（360dp 窄屏放不下文字），故用 tooltip 断言同一意图。
       expect(find.byType(WebViewPage), findsOneWidget);
-      expect(find.text('全功能视图'), findsWidgets);
+      expect(find.byTooltip('全功能视图'), findsOneWidget);
       // 否定断言：不能再停留在审批中心 / 登录页
       expect(find.text('审批中心'), findsNothing);
       expect(find.text('登录账号'), findsNothing);
@@ -128,7 +129,7 @@ void main() {
           await _pumpApp(tester, baseUrl: '', deviceId: '', userToken: null);
       expect(container.read(appSessionProvider).stage, AppStage.setup);
       expect(find.byType(WebViewPage), findsNothing);
-      expect(find.text('全功能视图'), findsNothing);
+      expect(find.byTooltip('全功能视图'), findsNothing);
     });
   });
 

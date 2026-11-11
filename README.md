@@ -1,7 +1,9 @@
 # harness_mobile
 
 harness **移动端客户端**：**Flutter + Dart** 单代码仓（Android / iOS）。
-定位是「**纯 WebView 主体 + 原生身份链路**」（2026-11 架构收口，提交 `15767d3`）——原生只负责**能进得来**：服务端地址 → 配对 → 登录 → 生物识别解锁 → 承载服务端 `web/dist` 的 WebView；**会话、审批、投递等业务界面一律由 Web UI 承担，原生不再重做一遍**。文件浏览、命令执行等重活属于桌面端。
+定位是「**纯 WebView 主体 + 原生身份链路**」（2026-11 架构收口，提交 `15767d3`）——原生只负责**能进得来**：服务端地址 → 配对 → 登录 → 承载服务端 `web/dist` 的 WebView；**会话、审批、投递等业务界面一律由 Web UI 承担，原生不再重做一遍**。文件浏览、命令执行等重活属于桌面端。
+
+> 🔴 2026-11 变更：**App 级生物识别解锁门已移除**（`webview_lock.dart` / `biometric_gate.dart` / `local_auth` 依赖及 `USE_BIOMETRIC`、`NSFaceIDUsageDescription` 声明全部删除）。单人自用场景下摩擦大于收益。身份链路现为「地址 → 配对 → 登录 → WebView」，不再有解锁环节。
 
 > 三端关系：`harness_go`（服务端 + Web）· `harness_desktop`（重执行工位）· **本端（随身的 Web 入口 + 身份门禁）**。
 > 设备协议经由服务端 `GET /api/v1/devices/ws` 长连接注册为 `kind=mobile` 设备，一切落库在服务端，端侧**永不直写 DB**。
@@ -16,8 +18,8 @@ harness **移动端客户端**：**Flutter + Dart** 单代码仓（Android / iOS
 | **批次 1** | WebView 全功能视图 / 最小 JS 桥 / 账号页 / iOS·Android 上架材料 | ✅ 已交付 |
 | ~~批次 2-1~~ | ~~相册/相机 → base64 投递（≤2MB）+ 重试队列~~ | ❌ **已注销**：`features/delivery`、`delivery_api.dart`、`delivery_queue.dart` 随 `15767d3` 整体删除 |
 | ~~批次 2-2/2-3~~ | ~~`task.dispatch` 白名单执行与 result 回传~~ | ❌ **已注销**：架构上放弃手机端本地执行（协议层 `TaskResultPayload` 仍保留，恒 `source_trust=untrusted`，仅作解码用） |
-| **批次 C** | **架构收口为 WebView 主体**：删除审批/会话/投递三域（含页面、仓储、data 层、路由），新增 App 级生物识别解锁门 `webview_lock.dart`、一次性票据透传 `webview_ticket_api.dart`、工作空间只读 `workspace_api.dart` | ✅ **已完成（含接线）**：删除与协议/身份链路已落地（`15767d3` / `4f2bfd3`）；`webview_lock.dart` 与 `webview_ticket_api.dart` 已由提交 `22ebbe5` 完成 UI 挂载与首帧认证注入（`webViewLockProvider` 已注入、`WebViewPage._prepareAuth` 已调用 `services.webviewTicket.prepareAuth`，首帧 URL 带 ticket fragment）；构建链已升级（见下方技术栈行） |
-| 批次 3 | 回前台 resync 编排 / 连接态诚实化 UI | 🔜 待开发（`device_ws.dart` 尚无生命周期钩子，`WebViewLock` 只做锁与重新验真，不做数据重拉） |
+| **批次 C** | **架构收口为 WebView 主体**：删除审批/会话/投递三域（含页面、仓储、data 层、路由），新增 App 级生物识别解锁门 `webview_lock.dart`、一次性票据透传 `webview_ticket_api.dart`、工作空间只读 `workspace_api.dart` | ✅ **已完成（含接线）**：删除与协议/身份链路已落地（`15767d3` / `4f2bfd3`）；`webview_ticket_api.dart` 已由提交 `22ebbe5` 完成首帧认证注入（`WebViewPage._prepareAuth` 已调用 `services.webviewTicket.prepareAuth`，首帧 URL 带 ticket fragment）；构建链已升级（见下方技术栈行）。🔴 **2026-11 变更**：`webview_lock.dart` 及生物识别依赖已整体移除，详见文首说明 |
+| 批次 3 | 回前台 resync 编排 / 连接态诚实化 UI | 🔜 待开发（`device_ws.dart` 状态机与 `ws_lifecycle_bridge.dart` 已实现但**尚未接入 App**：无 `deviceWsProvider`、真实 `DeviceConnection` 实现缺失，服务端目前拿不到设备状态） |
 | 批次 4 | 推送 / 大文件分片上传 / 增量同步 | ⏸ 阻塞于服务端（B1/B5/B3 缺口） |
 
 **质量基线**（每轮 CI 强制，实测环境 Flutter 3.47.9 / Dart 3.13.7）：
@@ -40,13 +42,18 @@ flutter build windows --debug                    → √ Built build\windows\x64
 > 2. **NDK 依赖**：`path_provider_android 2.3.0+` 经 `jni` 引入 C++ 源码（CMake），
 >    强制要求 NDK 27.0.12077973；本机未装 NDK。已通过 `dependency_overrides`
 >    锁定 `path_provider_android: 2.2.23`（无 jni）先行规避。
+>    ⚠️ **该覆盖不可轻易删除**（2026-11 实测）：`path_provider` 虽已不是直接依赖，
+>    但仍经 `flutter_secure_storage_windows` 传递引入；一旦移除覆盖，
+>    `path_provider_android` 会解析到 2.3.1 并把 `jni`/`jni_flutter` 拉回依赖树，
+>    Android 构建立刻硬失败。详见 `pubspec.yaml` 的 dependency_overrides 注释。
 > 3. **Windows 模式覆盖度足够**：`flutter_inappwebview` 在 Windows 走 WebView2，
->    WebView 主体、票据首帧注入、生物识别解锁门、路由与深链等**主流程均可验证**；
+>    WebView 主体、票据首帧注入、路由与深链等**主流程均可验证**；
 >    367MB 实跑内存 vs 模拟器 3.6GB，迭代成本低一个数量级。
 >
 > **适用范围与边界**：
-> - ✅ Windows 可验证：WebView 主体与业务界面、票据/认证注入、解锁门、路由与深链、WS 连接、账号页。
-> - ⚠️ Windows **无法验证**（须留待 Android/iOS）：`onShowFileChooser` / `runOpenPanelWith` 文件选择器、指纹/生物识别真机闸门、FCM/APNs 推送、Keystore/Keychain。
+> - ✅ Windows 可验证：WebView 主体与业务界面、票据/认证注入、路由与深链、账号页。
+> - ⚠️ Windows **无法验证**（须留待 Android/iOS）：`onShowFileChooser` / `runOpenPanelWith` 文件选择器、FCM/APNs 推送、Keystore/Keychain。
+> - ⚠️ 「WS 连接」目前**尚未接入 App**（`device_ws.dart` 状态机与生命周期桥已实现，但缺 `deviceWsProvider` 与真实 `DeviceConnection` 实现），故任何平台都还验证不到真实长连接。
 > - ❗ 涉及上述平台专属能力的功能，**不得以「Windows 通过」宣称交付完成**，须显式标注「待 Android/iOS 验证」。
 >
 > **Android 侧已修复但未最终验证的构建链改动**（待后续单独验证时复核）：
@@ -62,10 +69,10 @@ flutter build windows --debug                    → √ Built build\windows\x64
 | --- | --- | --- |
 | 业务与 UI（~85%） | **Dart 3.13 / Flutter 3.47**（`pubspec.yaml` 门槛仍为 `flutter >=3.24.0` / `sdk >=3.5.0`） | 编译期类型安全（sealed/records 表达协议帧）；单一工具链 `analyze + test`，CI 无需真机 |
 | Android 构建链 | **JDK 21 + Gradle 8.14.3 + AGP 8.11.1 + Kotlin 2.2.20**，`compileSdk 35`，Java 目标 17 | ⚠️ 2026-11 实测升级：Flutter 3.47.9 的硬下限为 Gradle **8.14.0** / AGP **8.11.1** / Kotlin **2.2.20**（见 `flutter_tools/gradle/.../DependencyVersionChecker.kt`）。原组合 8.7 / 8.6.1 / 1.9.24 是 Flutter 3.24 时代的写法，**在 3.47.9 下已被拒绝构建**；旧文档「Gradle 8.7 是 Flutter tool 的已知兼容上限」的表述已失效。 |
-| Android 平台通道 | Kotlin（minSdk 24） | 只做 FCM / Keystore / 生物识别的「能力代理」，不发 HTTP、不解析协议 |
-| iOS 平台通道 | Swift 5.9（iOS 14+） | 同上，只做 APNs / Keychain / LocalAuthentication |
+| Android 平台通道 | Kotlin（minSdk 24） | 只做 FCM / Keystore 的「能力代理」，不发 HTTP、不解析协议（生物识别代理已随 local_auth 移除，2026-11） |
+| iOS 平台通道 | Swift 5.9（iOS 14+） | 同上，只做 APNs / Keychain（LocalAuthentication 已随 local_auth 移除，2026-11） |
 | WebView 视图 | **`flutter_inappwebview ^6.1.5`**（Android/iOS 走原生 WebView，Windows 走 WebView2） | 业务界面**唯一归属**（会话/审批/工作区/工具市场）；**仓内 0 行 TypeScript**。选它而非 `webview_flutter`：后者只有 android/ios/macos 实现，**没有任何 Windows 路径** |
-| 桌面调试目标（非分发） | **Windows Desktop**（`windows/` 平台骨架 + WebView2 Runtime + NuGet CLI） | 让 Web 工作区能在本机低开销迭代（367MB vs 模拟器 3.6GB）；**不作为交付形态**，真机能力（指纹/相册/推送）仍只能在 Android/iOS 验证 |
+| 桌面调试目标（非分发） | **Windows Desktop**（`windows/` 平台骨架 + WebView2 Runtime + NuGet CLI） | 让 Web 工作区能在本机低开销迭代（367MB vs 模拟器 3.6GB）；**不作为交付形态**，真机能力（相册/推送）仍只能在 Android/iOS 验证 |
 
 **刻意不做过的事**（见 `../harness_go/docs/移动端架构与功能设计.md` §6.3.1）：
 
@@ -92,10 +99,8 @@ lib/
 │   ├── error/app_error.dart     # 对齐服务端 apperr：统一错误体 {"error":{...}}
 │   └── app/
 │       ├── app_session.dart     # 首屏门禁唯一事实来源（setup→pairing→login→webview）+ AppRoutes
-│       ├── webview_lock.dart    # ★ 批次 C：App 级生物识别解锁门（冷启/回前台超时/手动锁）
 │       ├── providers.dart       # Riverpod 依赖注入图
-│       ├── api_services.dart    # ApiFactory（按 baseUrl 缓存实例）+ /healthz 探测
-│       └── biometric_gate.dart  # 生物识别抽象（真机/AlwaysPass/AlwaysDeny 可注入）
+│       └── api_services.dart    # ApiFactory（按 baseUrl 缓存实例）+ /healthz 探测
 │
 ├── data/
 │   ├── local/

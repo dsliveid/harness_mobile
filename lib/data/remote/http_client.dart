@@ -82,6 +82,21 @@ class ApiClient {
   /// 标记请求免鉴权（登录、配对）。
   static Options skipAuth() => Options(extra: {skipAuthKey: true});
 
+  /// 用**设备令牌**（而非用户令牌）鉴权的请求选项。
+  ///
+  /// 为什么必须绕开默认注入：默认拦截器注入的是 `user_token`（Keychain 里的
+  /// 用户会话），而 `POST /api/v1/devices/session` 是**反向**的 ——
+  /// 它要求 `Bearer <device_token>`，且用户令牌打过去会被判 401
+  /// （服务端只认装在 devices 表里的那枚令牌）。
+  ///
+  /// 实现上复用 [skipAuthKey]：拦截器看到该标记就不再注入用户令牌，
+  /// 于是这里手工写进 header 的设备令牌成为**唯一**的 Authorization，
+  /// 不会出现两个令牌互相覆盖的竞态。
+  static Options deviceAuth(String deviceToken) => Options(
+        extra: {skipAuthKey: true},
+        headers: {'Authorization': 'Bearer $deviceToken'},
+      );
+
   /// 更换 baseUrl（用户切换服务端地址时调用）。
   void setBaseUrl(String baseUrl) {
     _dio.options.baseUrl = baseUrl;

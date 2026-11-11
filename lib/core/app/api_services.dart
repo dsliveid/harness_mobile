@@ -48,9 +48,14 @@ class ApiServices {
   );
 
   /// WebView 认证透传（方案 C ticket 签发 + 方案 B Cookie 注入降级）。
+  ///
+  /// 显式注入 [device] 而不是让它自建一个：续期（`POST /devices/session`）
+  /// 与配对（`POST /devices/pair`）共用同一枚设备令牌与同一个 Keychain 写入点，
+  /// 两个实例虽然等价，但共用一份能让「谁在改令牌」这件事只有一个归属。
   late final WebViewTicketApi webviewTicket = WebViewTicketApi(
     client: client,
     store: _store,
+    deviceApi: device,
   );
 
   /// 工作空间只读消费（移动端不建/不改/不删，见 workspace_api.dart 头注释）。

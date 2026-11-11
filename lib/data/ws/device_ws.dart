@@ -1,7 +1,8 @@
 /// 设备长连接状态机（`GET /api/v1/devices/ws`，JSON Lines 协议）。
 ///
 /// 本文件只做「连接生命周期」，不含 UI、不含业务语义：
-/// - 握手：连上 → 发 `hello` → 等 `welcome` → 用 `welcome.heartbeat_s * 0.8` 起心跳
+/// - 握手：连上 → 发 `hello` → 等 `welcome`（⚠️ 时序见铁律 2）→
+///   用 `welcome.heartbeat_s * 0.8` 起心跳
 /// - 心跳：周期发 `ping`（`load` 可空）
 /// - 退避：1s→2s→4s→8s→30s 封顶，±20% 抖动，**连续 5 次后转 dead**
 /// - 帧级错误：按 `ErrorPayload.action` 分派（决策表见 `envelope.dart` 的 `WsFatalAction`）
@@ -10,7 +11,13 @@
 /// 1. 心跳间隔**只能**取 [WelcomePayload.heartbeatInterval]，绝不硬编码 15s
 ///    （15s 只是服务端默认值；`protocol.go:200-209`）。收到 `welcome` 前用
 ///   [fallbackHeartbeat] 兜底，避免「服务端不回 welcome」时连接被判定离线。
-/// 2. 令牌只出现在 URI / 请求头，日志一律走 `maskToken`（红线 R3）。
+/// 2. 🔴 **welcome 可能先于 hello 到达**（2026-11 核实服务端源码）：
+///    网关在连接注册后**立刻**下发 welcome（`gateway.go:205`），**不等 hello**；
+///    随后收到 hello 时还会**再下发一次** welcome（`gateway.go:315`，带 pending）。
+///    因此本状态机绝不能假设「必须先发 hello 才可能收到 welcome」——
+///    收到首个 welcome 即视为握手完成即可；服务端对重复 welcome 与端侧误发
+///    welcome/pong 都是**容忍**的（`gateway.go:325-327`），不会因此断连。
+/// 3. 令牌只出现在 URI / 请求头，日志一律走 `maskToken`（红线 R3）。
 library;
 
 import 'dart:async';
@@ -30,7 +37,11 @@ enum DeviceWsState {
   /// 正在建立 TCP/WS 连接。
   connecting,
 
-  /// 已连上，已发 `hello`，等待 `welcome`。
+  /// 已连上，等待或已收到 `welcome`。
+  ///
+  /// ⚠️ 注意本状态**不代表**「hello 已发出」：服务端连上即下发 welcome
+  /// （`gateway.go:205`），welcome 完全可能先于 hello 到达。判据只看
+  /// 「是否已收到 welcome」，不看「是否已发 hello」。
   handshaking,
 
   /// 握手完成，心跳运行中（唯一「可用」状态）。

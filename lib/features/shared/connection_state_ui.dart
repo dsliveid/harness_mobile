@@ -224,7 +224,7 @@ class ConnectionStateChip extends StatelessWidget {
       deadReason: deadReason,
       retryCount: retryCount,
     );
-    final color = _colorOf(theme, visual.tone);
+    final color = colorForConnectionTone(theme, visual.tone);
 
     if (compact) {
       return Chip(
@@ -269,17 +269,88 @@ class ConnectionStateChip extends StatelessWidget {
       ),
     );
   }
+}
 
-  Color _colorOf(ThemeData theme, ConnectionTone tone) {
-    switch (tone) {
-      case ConnectionTone.neutral:
-        return theme.colorScheme.outline;
-      case ConnectionTone.progress:
-        return theme.colorScheme.tertiary;
-      case ConnectionTone.good:
-        return theme.colorScheme.primary;
-      case ConnectionTone.alert:
-        return theme.colorScheme.error;
-    }
+/// 颜色语义 → 具体颜色（**唯一解析点**，Chip 与 Dot 共用）。
+///
+/// 提取为顶层函数的原因：AppBar 降高后同时存在「文字 Chip」与「极简圆点」
+/// 两种呈现，若各写一份 switch，改配色时必然漏改一处 —— 那正是
+/// `connection_state_ui.dart` 开头批判的「UI 与状态机各说一套」。
+Color colorForConnectionTone(ThemeData theme, ConnectionTone tone) {
+  switch (tone) {
+    case ConnectionTone.neutral:
+      return theme.colorScheme.outline;
+    case ConnectionTone.progress:
+      return theme.colorScheme.tertiary;
+    case ConnectionTone.good:
+      return theme.colorScheme.primary;
+    case ConnectionTone.alert:
+      return theme.colorScheme.error;
+  }
+}
+
+/// 极简连接状态圆点（窄屏 AppBar 专用，替代中文文字 Chip）。
+///
+/// 设计动机：中文 Chip（如「连接已断开」）在 360dp 宽屏上会吃掉约 70dp
+/// 横向空间，把标题与三个操作图标挤到临界溢出。圆点只占 18dp，
+/// 完整语义通过 [Semantics] 与 tooltip / 长按详情 Sheet 承载。
+///
+/// **红线不变**：仍然只读 [visualForConnectionState]，自己不做任何
+/// 状态推断，颜色与图标语义始终与该映射表同源。
+class ConnectionStateDot extends StatelessWidget {
+  const ConnectionStateDot({
+    super.key,
+    required this.state,
+    this.deadReason,
+    this.retryCount = 0,
+    this.size = 10,
+  });
+
+  final DeviceWsState state;
+  final DeviceWsDeadReason? deadReason;
+  final int retryCount;
+
+  /// 圆点直径（光晕自动按此推算，无需另传）。
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final visual = visualForConnectionState(
+      state,
+      deadReason: deadReason,
+      retryCount: retryCount,
+    );
+    final color = colorForConnectionTone(theme, visual.tone);
+
+    return Semantics(
+      label: '设备连接：${visual.label}',
+      button: true,
+      child: SizedBox(
+        // 光晕直径 + 2dp 呼吸空间
+        width: size + 10,
+        height: size + 10,
+        child: Center(
+          child: Container(
+            width: size + 8,
+            height: size + 8,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: color.withValues(alpha: 0.18),
+            ),
+            child: Center(
+              child: Container(
+                width: size,
+                height: size,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: color,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }

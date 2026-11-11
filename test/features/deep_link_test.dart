@@ -19,9 +19,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:harness_mobile/core/app/api_services.dart';
 import 'package:harness_mobile/core/app/app_session.dart';
-import 'package:harness_mobile/core/app/biometric_gate.dart';
 import 'package:harness_mobile/core/app/providers.dart';
-import 'package:harness_mobile/core/app/webview_lock.dart';
 import 'package:harness_mobile/data/local/app_settings_store.dart';
 import 'package:harness_mobile/data/local/secure_store.dart';
 import 'package:harness_mobile/features/webview/js_bridge.dart';
@@ -120,14 +118,7 @@ Future<ProviderContainer> _pump(
           dio: Dio()..httpClientAdapter = _TicketAdapter(),
         ),
       ),
-      // 解锁门显式置为「已解锁」：本组用例只关心深链拦截，不重复断言锁屏语义
-      //（锁屏 fail-closed 由 webview_lock_test.dart 独立守住）。
-      webViewLockProvider.overrideWith(
-        (Ref ref) => WebViewLock(
-          gate: const AlwaysPassBiometricGate(),
-          initial: WebViewLockState.unlocked,
-        ),
-      ),
+      // 解锁门已移除（2026-11 取消生物锁）：这里无需再 override 任何锁 provider。
     ],
   );
   addTearDown(container.dispose);
@@ -378,12 +369,19 @@ void main() {
       }
     });
 
-    test('白名单只有 session / reauth 两个类型（新增类型必须改白名单与测试）', () {
-      expect(DeepLinkKind.values.length, 2);
+    test('白名单只有 session / reauth / settings 三个类型（新增类型必须改白名单与测试）', () {
+      expect(DeepLinkKind.values.length, 3);
       expect(
         DeepLinkKind.values.map((DeepLinkKind k) => k.name).toSet(),
-        <String>{'session', 'reauth'},
+        <String>{'session', 'reauth', 'settings'},
       );
+    });
+
+    test('harness://settings → settings 意图（契约三：页面浮标回原生设置页）', () {
+      final decision = resolveDeepLink('harness://settings');
+      expect(decision.accepted, isTrue, reason: decision.rejectMessage);
+      expect(decision.intent!.kind, DeepLinkKind.settings);
+      expect(decision.intent!.id, isEmpty);
     });
   });
 }

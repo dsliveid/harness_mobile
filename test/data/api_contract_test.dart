@@ -6,6 +6,8 @@
 /// (c) 登录请求体键恰为 `{username,password}`，单令牌落盘 SecureStore
 /// (d) webview-ticket 请求体键恰为 `{device_id,ttl_s}`（红线 R3：ticket 不进日志）
 /// (e) Workspace 只读消费：只有 list/get，**不存在**任何写方法
+/// (f) 配对响应可选携带 `user_token/user/session_ttl_s`：齐备则落盘用户令牌
+///     （与登录同规格），缺失或畸形则**合法降级**且绝不抛异常
 ///
 /// ⚠️ **不发真请求**：通过替换 dio 的 `HttpClientAdapter` 拦截全部出网调用，
 /// 并断言请求体的**键集合**（服务端 `DisallowUnknownFields`，多一个键即 400）。
@@ -188,6 +190,143 @@ void main() {
     });
   });
 
+  group('配对响应携带用户会话（「配对后免二次登录」）', () {
+    /// 完整 201 响应（服务端新契约，三兄弟齐备）。
+    Map<String, dynamic> fullPairBody() => <String, dynamic>{
+          'device_id': 'dev_1',
+          'device_token': 'dt_secret',
+          'ws_path': '/api/v1/devices/ws',
+          'protocol_version': 1,
+          'user_token': 'hgt_secret',
+          'user': <String, dynamic>{
+            'id': 'u1',
+            'username': 'alice',
+            'display_name': '爱丽丝',
+            'role': 'owner',
+          },
+          'session_ttl_s': 604800,
+        };
+
+    test('三兄弟齐备 → user_token 与登录同规格落 Keychain', () async {
+      final (:client, :adapter, :store) = _build(
+        (RequestOptions options) => fullPairBody(),
+      );
+      final paired =
+          await DeviceApi(client: client, store: store).pair(
+        code: '123456',
+        name: '我的手机',
+      );
+
+      expect(paired.hasUserSession, isTrue);
+      expect(paired.userToken, 'hgt_secret');
+      expect(paired.user?.username, 'alice');
+      expect(paired.user?.displayName, '爱丽丝');
+      expect(paired.user?.role, 'owner');
+      expect(paired.sessionTtlS, 604800);
+      // 与 AuthApi.login 完全同一个键（SecureKeys.userToken）
+      expect(await store.getUserToken(), 'hgt_secret');
+      // 设备令牌照旧落盘（两条凭据互不覆盖）
+      expect(await store.getDeviceToken(), 'dt_secret');
+      expect(
+        store.keys,
+        unorderedEquals(<String>[
+          SecureKeys.deviceToken,
+          SecureKeys.userToken,
+        ]),
+      );
+      // 响应多出的字段不得影响上行请求体（DisallowUnknownFields 是单向的）
+      _expectExactKeys(
+        _bodyOf(adapter.captured.single),
+        <String>{
+          'code',
+          'name',
+          'kind',
+          'platform',
+          'app_version',
+          'capabilities',
+        },
+      );
+    });
+
+    test('三兄弟缺失 → 合法降级：配对仍成功，用户令牌不落盘', () async {
+      final (:client, :adapter, :store) = _build(
+        (RequestOptions options) => <String, dynamic>{
+          'device_id': 'dev_1',
+          'device_token': 'dt_secret',
+          'ws_path': '/api/v1/devices/ws',
+          'protocol_version': 1,
+        },
+      );
+      final paired =
+          await DeviceApi(client: client, store: store).pair(
+        code: '123456',
+        name: '我的手机',
+      );
+
+      // 不得抛异常（旧服务端 / 历史配对码都必须走通）
+      expect(paired.hasUserSession, isFalse);
+      expect(paired.userToken, isNull);
+      expect(paired.user, isNull);
+      expect(paired.sessionTtlS, isNull);
+      expect(await store.getUserToken(), isNull);
+      // 设备授权照常生效
+      expect(await store.getDeviceToken(), 'dt_secret');
+      expect(paired.deviceId, 'dev_1');
+    });
+
+    test('只有 user_token 而无 user/ttl → 视为降级（不留半个登录态）', () async {
+      final (:client, :adapter, :store) = _build(
+        (RequestOptions options) => <String, dynamic>{
+          'device_id': 'dev_1',
+          'device_token': 'dt_secret',
+          'ws_path': '/ws',
+          'protocol_version': 1,
+          'user_token': 'hgt_secret',
+        },
+      );
+      final paired =
+          await DeviceApi(client: client, store: store).pair(
+        code: '123456',
+        name: '我的手机',
+      );
+
+      expect(paired.hasUserSession, isFalse);
+      expect(await store.getUserToken(), isNull);
+    });
+
+    test('畸形字段（类型不符 / user 非对象）不抛异常且不落用户令牌', () async {
+      final (:client, :adapter, :store) = _build(
+        (RequestOptions options) => <String, dynamic>{
+          'device_id': 'dev_1',
+          'device_token': 'dt_secret',
+          'ws_path': '/ws',
+          'protocol_version': 1,
+          // 故意全部给错类型
+          'user_token': 12345,
+          'user': 'not-an-object',
+          'session_ttl_s': <String, dynamic>{'nested': true},
+        },
+      );
+      final paired =
+          await DeviceApi(client: client, store: store).pair(
+        code: '123456',
+        name: '我的手机',
+      );
+
+      expect(paired.hasUserSession, isFalse);
+      expect(paired.user, isNull);
+      expect(await store.getUserToken(), isNull);
+      expect(await store.getDeviceToken(), 'dt_secret');
+    });
+
+    test('红线 R3：toString 绝不泄漏 user_token 明文', () {
+      final paired = PairedDevice.fromJson(fullPairBody());
+      expect(paired.toString().contains('hgt_secret'), isFalse);
+      expect(paired.toString().contains('dt_secret'), isFalse);
+      expect(paired.toString().contains('signedIn=true'), isTrue);
+    });
+  });
+
   group('WebView 票据 / 工作空间上行契约（批次 C 新增）', () {
     test('webview-ticket 请求体键恰为 {device_id,ttl_s}', () async {
       final (:client, :adapter, :store) = _build(
@@ -308,6 +447,203 @@ void main() {
             '工作空间不存在',
           ),
         ),
+      );
+    });
+  });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // 设备令牌自续会话契约（POST /api/v1/devices/session）
+  //
+  // 权威契约：只认 `Authorization: Bearer <device_token>`；三字段
+  // `user_token` / `user` / `session_ttl_s` 要么全有要么全无；幂等可重试。
+  // 端侧最容易犯的错是「沿用默认拦截器 → 打出去的是 user_token」，
+  // 服务端会直接 401，因此这里对 header 做**精确断言**。
+  // ════════════════════════════════════════════════════════════════════════
+  group('设备令牌自续会话（devices/session）契约', () {
+    Map<String, dynamic> sessionBody() => <String, dynamic>{
+          'user_token': 'hgt_renewed',
+          'user': <String, dynamic>{
+            'id': 'u1',
+            'username': 'alice',
+            'display_name': 'Alice',
+            'role': 'owner',
+          },
+          'session_ttl_s': 604800,
+        };
+
+    test('Bearer 必须是 device_token（绝不能被默认拦截器换成 user_token）',
+        () async {
+      final (:client, :adapter, :store) = _build(
+        (RequestOptions options) => sessionBody(),
+      );
+      // 两枚令牌同时存在：这正是真机上「老用户会话 + 设备令牌」的常态。
+      await store.setUserToken('ut_old');
+      await store.setDeviceToken('dt_secret');
+
+      await DeviceApi(client: client, store: store).renewSession();
+
+      final options = adapter.captured.single;
+      expect(options.path, '/api/v1/devices/session');
+      expect(options.method, 'POST');
+      // ★ 核心断言：header 里只有设备令牌，用户令牌绝不能出现
+      expect(options.headers['Authorization'], 'Bearer dt_secret');
+      expect(options.headers['Authorization'], isNot('Bearer ut_old'));
+    });
+
+    test('无 body 键（服务端 DisallowUnknownFields，多余键即 400）', () async {
+      final (:client, :adapter, :store) = _build(
+        (RequestOptions options) => sessionBody(),
+      );
+      await store.setDeviceToken('dt_secret');
+
+      await DeviceApi(client: client, store: store).renewSession();
+
+      // 无 body 时按空对象发送（不是 null，也不是任何业务键）
+      _expectExactKeys(_bodyOf(adapter.captured.single), <String>{});
+    });
+
+    test('成功：新令牌落 Keychain（与登录/配对同规格），响应不含明文回显依赖',
+        () async {
+      final (:client, :adapter, :store) = _build(
+        (RequestOptions options) => sessionBody(),
+      );
+      await store.setDeviceToken('dt_secret');
+
+      final outcome = await DeviceApi(client: client, store: store).renewSession();
+
+      expect(outcome.renewed, isTrue);
+      expect(outcome.user?.username, 'alice');
+      expect(outcome.sessionTtlS, 604800);
+      // 红线 R3：令牌只落 SecureStore
+      expect(await store.getUserToken(), 'hgt_renewed');
+    });
+
+    test('字段缺失 / 类型不符 / user 为 null → 不抛异常，按降级处理', () async {
+      for (final Object? body in <Object?>[
+        <String, dynamic>{}, // 全缺
+        <String, dynamic>{'user_token': 12345}, // 类型不符
+        <String, dynamic>{'user_token': 'hgt_x', 'user': null, 'session_ttl_s': 'x'},
+      ]) {
+        final (:client, :adapter, :store) = _build(
+          (RequestOptions options) => body,
+        );
+        await store.setDeviceToken('dt_secret');
+        final outcome =
+            await DeviceApi(client: client, store: store).renewSession();
+        // 类型不符/缺失一律视为「没换到会话」，绝不抛异常打断首帧链路
+        expect(outcome.status, isNot(DeviceSessionStatus.rejected));
+      }
+    });
+
+    test('user_token 畸形（非字符串）→ unavailable，且**不写** Keychain', () async {
+      final (:client, :adapter, :store) = _build(
+        (RequestOptions options) => <String, dynamic>{'user_token': 12345},
+      );
+      await store.setUserToken('ut_keep');
+      await store.setDeviceToken('dt_secret');
+
+      final outcome = await DeviceApi(client: client, store: store).renewSession();
+
+      expect(outcome.renewed, isFalse);
+      // 拿不到令牌就不能改动已有会话（否则等于把用户踢下线）
+      expect(await store.getUserToken(), 'ut_keep');
+    });
+
+    test('401（吊销/误用用户令牌）与 403（owner_unknown）→ rejected', () async {
+      for (final int status in <int>[401, 403]) {
+        final store = InMemorySecureStore();
+        await store.setDeviceToken('dt_secret');
+        // _build 的适配器恒返回 200，这里按状态码回应（401/403 是拒绝语义）
+        final adapter = _FakeAdapter(
+          (RequestOptions options) => _jsonBody(
+            <String, dynamic>{
+              'error': <String, dynamic>{
+                'code': status == 403 ? 'device.owner_unknown' : 'unauthorized',
+                'message': '拒绝',
+              },
+            },
+            status: status,
+          ),
+        );
+        final client = ApiClient(
+          baseUrl: 'http://localhost:8080',
+          tokens: TokenProvider(store),
+          dio: Dio()..httpClientAdapter = adapter,
+        );
+        final outcome =
+            await DeviceApi(client: client, store: store).renewSession();
+        expect(
+          outcome.status,
+          DeviceSessionStatus.rejected,
+          reason: 'HTTP $status 必须是确定性拒绝（引导重新配对/登录）',
+        );
+      }
+    });
+
+    test('404 / 5xx（端点未实现、服务端异常）→ unavailable（只值得重试）', () async {
+      for (final int status in <int>[404, 500]) {
+        final store = InMemorySecureStore();
+        await store.setDeviceToken('dt_secret');
+        final adapter = _FakeAdapter(
+          (RequestOptions options) => _jsonBody(
+            <String, dynamic>{'error': <String, dynamic>{'code': 'x'}},
+            status: status,
+          ),
+        );
+        final client = ApiClient(
+          baseUrl: 'http://localhost:8080',
+          tokens: TokenProvider(store),
+          dio: Dio()..httpClientAdapter = adapter,
+        );
+        final outcome =
+            await DeviceApi(client: client, store: store).renewSession();
+        expect(
+          outcome.status,
+          DeviceSessionStatus.unavailable,
+          reason: 'HTTP $status 属于无法判定，只值得重试',
+        );
+      }
+    });
+
+    test('未配对（无 device_token）→ 直接 unavailable，不打端点', () async {
+      final (:client, :adapter, :store) = _build(
+        (RequestOptions options) => sessionBody(),
+      );
+      final outcome = await DeviceApi(client: client, store: store).renewSession();
+
+      expect(outcome.renewed, isFalse);
+      expect(outcome.status, DeviceSessionStatus.unavailable);
+      // 连身份都没有，打端点只会换回一个 401
+      expect(adapter.captured, isEmpty);
+    });
+
+    test('isSessionValid：200 为有效，401 为无效（Cookie 注入的唯一判据）', () async {
+      // 有效
+      final ok = _build((RequestOptions options) => <String, dynamic>{'id': 'u1'});
+      await ok.store.setUserToken('ut_live');
+      expect(
+        await DeviceApi(client: ok.client, store: ok.store).isSessionValid(),
+        isTrue,
+      );
+      expect(ok.adapter.captured.single.path, '/api/v1/auth/me');
+
+      // 无效：401 必须判为 false（否则死令牌会被写进 hg_sess）
+      final store = InMemorySecureStore();
+      await store.setUserToken('ut_dead');
+      final badAdapter = _FakeAdapter(
+        (RequestOptions options) => _jsonBody(
+          <String, dynamic>{'error': <String, dynamic>{'code': 'unauthorized'}},
+          status: 401,
+        ),
+      );
+      final badClient = ApiClient(
+        baseUrl: 'http://localhost:8080',
+        tokens: TokenProvider(store),
+        dio: Dio()..httpClientAdapter = badAdapter,
+      );
+      expect(
+        await DeviceApi(client: badClient, store: store).isSessionValid(),
+        isFalse,
       );
     });
   });

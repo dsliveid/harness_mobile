@@ -23,6 +23,13 @@ enum DeepLinkKind {
 
   /// `harness://reauth` → Cookie 失效时请求原生重签 ticket / 重新解锁。
   reauth,
+
+  /// `harness://settings` → 打开原生服务端地址配置页（契约三，2026-11）。
+  ///
+  /// 来源是服务端 SPA 的「宿主设置」浮标（hostShell.ts）：主界面三端同构、
+  /// 由服务端下发，客户端的设置入口不属于任何业务菜单 —— 页面通过深链
+  /// 表达「我要回原生设置页」的意图，端侧 push('/setup')。
+  settings,
 }
 
 /// 解析出的结构化意图。
@@ -153,9 +160,10 @@ class DeepLinkDecision {
 
 /// 解析页面下发的深链（**带拒绝原因**的完整版）。
 ///
-/// 只接受两种形态：
+/// 只接受三种形态：
 /// - `harness://session/<id>`
 /// - `harness://reauth`
+/// - `harness://settings`（契约三：页面浮标请求回原生设置页，2026-11）
 ///
 /// 其余（含 `https://`、`harness://approval/...`、未知类型、session 缺 id）
 /// 一律 [DeepLinkDecision.rejected] —— 白名单机制，避免页面用任意 URL
@@ -183,11 +191,14 @@ DeepLinkDecision resolveDeepLink(String url) {
       kind = DeepLinkKind.session;
     case 'reauth':
       kind = DeepLinkKind.reauth;
+    case 'settings':
+      kind = DeepLinkKind.settings;
     default:
       return const DeepLinkDecision.rejected(DeepLinkRejection.unknownHost);
   }
 
-  if (kind == DeepLinkKind.reauth) {
+  // settings 与 reauth 同款：无 id、无路径（intent.id 恒空串）。
+  if (kind == DeepLinkKind.reauth || kind == DeepLinkKind.settings) {
     return DeepLinkDecision.accepted(
       DeepLinkIntent(kind: kind, id: '', rawUrl: text),
     );

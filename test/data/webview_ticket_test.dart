@@ -78,6 +78,7 @@ class _FakeCookieSink implements WebViewCookieSink {
 ({WebViewTicketApi api, _FakeAdapter adapter, InMemorySecureStore store}) _build(
   ResponseBody Function(RequestOptions options) handler, {
   String? userToken,
+  String? deviceToken,
   int ttl = 120,
 }) {
   final adapter = _FakeAdapter(handler);
@@ -85,6 +86,9 @@ class _FakeCookieSink implements WebViewCookieSink {
   if (userToken != null) {
     // InMemorySecureStore 的写入是同步落 Map 的，这里用 await 保持接口一致
     store.setUserToken(userToken);
+  }
+  if (deviceToken != null) {
+    store.setDeviceToken(deviceToken);
   }
   final client = ApiClient(
     baseUrl: 'http://localhost:8080',
@@ -274,13 +278,21 @@ void main() {
     });
 
     test('ticket 端点 404 → 静默降级到方案 B（不抛给 UI）', () async {
+      // 路径感知：票据端点 404，但 `/auth/me` 必须 200 —— 否则 Cookie 降级前的
+      // 有效性校验会把本次降级判为不可用（那是 Bug 2 修复的应有行为），
+      // 本条断言的是「票据不可用时能降级」，因此用户会话必须是**有效的**。
       final (:api, :adapter, :store) = _build(
-        (RequestOptions options) => _json(
-          <String, dynamic>{
-            'error': <String, dynamic>{'code': 'not_found', 'message': '未实现'},
-          },
-          status: 404,
-        ),
+        (RequestOptions options) {
+          if (options.path == '/api/v1/auth/me') {
+            return _json(<String, dynamic>{'id': 'u1', 'username': 'alice'});
+          }
+          return _json(
+            <String, dynamic>{
+              'error': <String, dynamic>{'code': 'not_found', 'message': '未实现'},
+            },
+            status: 404,
+          );
+        },
         userToken: 'ut_secret',
       );
       final sink = _FakeCookieSink();
@@ -318,8 +330,7 @@ void main() {
 
     test('无 deviceId → 直接跳过方案 C，只用 Cookie 降级', () async {
       final (:api, :adapter, :store) = _build(
-        (RequestOptions options) =>
-            _json(<String, dynamic>{'ticket': 'tk', 'expires_at': 1}),
+        (RequestOptions options) => _json(<String, dynamic>{'ticket': 'tk', 'expires_at': 1}),
         userToken: 'ut_secret',
       );
       final sink = _FakeCookieSink();
@@ -330,8 +341,12 @@ void main() {
       );
 
       expect(result.mode, WebViewAuthMode.cookie);
-      // 未尝试签发 ticket
-      expect(adapter.captured, isEmpty);
+      // 未尝试签发 ticket（Cookie 降级前的有效性校验会打 /auth/me，
+      // 那是**另一条**端点，不能用「零请求」来断言「没走方案 C」）
+      expect(
+        adapter.captured.map((RequestOptions r) => r.path),
+        isNot(contains('/api/v1/auth/webview-ticket')),
+      );
     });
 
     test('Cookie sink 拒绝写入 → none（不得谎报已透传）', () async {
@@ -348,6 +363,142 @@ void main() {
       );
       expect(result.mode, WebViewAuthMode.none);
       expect(result.ready, isFalse);
+    });
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // P1 兜底加固：「两轮登录」回归保护。
+  //
+  // 旧实现 ticket 一成功就 return，方案 B（写 hg_sess）永远走不到 —— 于是
+  // Web 前端一旦没有消费 `#ticket=`（兑换环节断链），页面 `/auth/me` 就 401，
+  // 用户在 WebView 里被要求**再登一次**。
+  // 新语义：ticket 成功 → 仍 best-effort 补写 Cookie，但**绝不**因补写失败降级。
+  // ══════════════════════════════════════════════════════════════════════════
+  group('prepareAuth：ticket 成功后的 best-effort Cookie 兜底（P1）', () {
+    /// 票据端点吐有效票，其余（`/auth/me`）按 [sessionValid] 应答。
+    ({WebViewTicketApi api, _FakeAdapter adapter, InMemorySecureStore store})
+        buildTicketOk({bool sessionValid = true}) => _build(
+              (RequestOptions options) {
+                if (options.path == '/api/v1/auth/me') {
+                  return sessionValid
+                      ? _json(<String, dynamic>{'id': 'u1', 'username': 'alice'})
+                      : _json(
+                          <String, dynamic>{
+                            'error': <String, dynamic>{'code': 'unauthorized'},
+                          },
+                          status: 401,
+                        );
+                }
+                return _json(<String, dynamic>{
+                  'ticket': 'tk_1',
+                  'expires_at': 1893456000000, // 2030-01-01，确保未过期
+                });
+              },
+              userToken: 'ut_secret',
+            );
+
+    test('ticket 成功 + Cookie 注入也成功 → mode=ticket 且 cookieInjected=true',
+        () async {
+      final (:api, :adapter, :store) = buildTicketOk();
+      final sink = _FakeCookieSink();
+      final result = await api.prepareAuth(
+        baseUrl: 'http://localhost:8080',
+        entryUrl: 'http://localhost:8080/',
+        deviceId: 'dev_1',
+        cookieSink: sink,
+      );
+
+      // 主路径不变：仍然是 ticket（兜底不得篡改 mode）
+      expect(result.mode, WebViewAuthMode.ticket);
+      expect(result.ready, isTrue);
+      expect(result.failure, isNull);
+      expect(result.url, contains('#ticket=tk_1'));
+      // 兜底确实落地：双写（ticket + hg_sess）
+      expect(result.cookieInjected, isTrue);
+      expect(sink.writes.single.name, kSessionCookieName);
+      expect(sink.writes.single.value, 'ut_secret');
+    });
+
+    test('★ ticket 成功 + Cookie 注入失败 → 仍 mode=ticket / ready / failure=null',
+        () async {
+      // 本组**最关键**的回归保护：兜底失败绝不能把已成功的 ticket 降级，
+      // 更不能产生 failure 文案（否则用户会看到与本可用的链路无关的错误）。
+      final (:api, :adapter, :store) = buildTicketOk();
+      final sink = _FakeCookieSink(accept: false);
+      final result = await api.prepareAuth(
+        baseUrl: 'http://localhost:8080',
+        entryUrl: 'http://localhost:8080/',
+        deviceId: 'dev_1',
+        cookieSink: sink,
+      );
+
+      expect(result.mode, WebViewAuthMode.ticket);
+      expect(result.ready, isTrue);
+      expect(result.failure, isNull);
+      expect(result.failureMessage, '');
+      expect(result.url, contains('#ticket=tk_1'));
+      // 观测位如实反映「没写进去」
+      expect(result.cookieInjected, isFalse);
+      // 确实尝试过（证明不是「压根没走兜底」的假通过）
+      expect(sink.writes.length, 1);
+    });
+
+    test('ticket 成功 + Cookie 前置校验失败（/auth/me 401）→ 不写 jar 也不降级',
+        () async {
+      // 死令牌绝不能进 Cookie jar（Bug 2 铁律），但 ticket 依然可用。
+      final (:api, :adapter, :store) = buildTicketOk(sessionValid: false);
+      final sink = _FakeCookieSink();
+      final result = await api.prepareAuth(
+        baseUrl: 'http://localhost:8080',
+        entryUrl: 'http://localhost:8080/',
+        deviceId: 'dev_1',
+        cookieSink: sink,
+      );
+
+      expect(sink.writes, isEmpty);
+      expect(result.mode, WebViewAuthMode.ticket);
+      expect(result.cookieInjected, isFalse);
+      expect(result.failure, isNull);
+    });
+
+    test('ticket 成功 + cookieSink == null → 不抛异常，cookieInjected=false',
+        () async {
+      final (:api, :adapter, :store) = buildTicketOk();
+      final result = await api.prepareAuth(
+        baseUrl: 'http://localhost:8080',
+        entryUrl: 'http://localhost:8080/',
+        deviceId: 'dev_1',
+        // 未装配 Cookie 端口（WebViewPage 在某些入口就是这样）
+        cookieSink: null,
+      );
+
+      expect(result.mode, WebViewAuthMode.ticket);
+      expect(result.ready, isTrue);
+      expect(result.cookieInjected, isFalse);
+    });
+
+    test('Cookie 降级成功时 cookieInjected 也应为 true（观测位语义一致）',
+        () async {
+      // 反面对照：降级路径本来就是「注入成功才 return」，因此必须为 true。
+      final (:api, :adapter, :store) = _build(
+        (RequestOptions options) {
+          if (options.path == '/api/v1/auth/me') {
+            return _json(<String, dynamic>{'id': 'u1', 'username': 'alice'});
+          }
+          return _json(<String, dynamic>{}, status: 404); // 票据端点未实现
+        },
+        userToken: 'ut_secret',
+      );
+      final sink = _FakeCookieSink();
+      final result = await api.prepareAuth(
+        baseUrl: 'http://localhost:8080',
+        entryUrl: 'http://localhost:8080/',
+        deviceId: 'dev_1',
+        cookieSink: sink,
+      );
+
+      expect(result.mode, WebViewAuthMode.cookie);
+      expect(result.cookieInjected, isTrue);
     });
   });
 
