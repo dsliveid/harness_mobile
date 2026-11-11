@@ -249,9 +249,15 @@ void main() {
 
   group('prepareAuth（方案 C 优先，失败降级 B）', () {
     test('ticket 可用 → mode=ticket 且 URL 带 fragment', () async {
+      // ⚠️ fixture 修正（M3）：`expires_at` 是**毫秒**时间戳，原值 999 对应
+      // 1970-01-01，本身就是一张过期票 —— 旧实现不校验过期因此侥幸通过，
+      // 而 M3 起过期票会被判废重签（这正是要修的白屏成因）。
+      // 这里改成远期时间戳以表达「票仍然有效」，断言强度不变。
+      const futureExpiry = 1893456000000; // 2030-01-01
       final (:api, :adapter, :store) = _build(
-        (RequestOptions options) =>
-            _json(<String, dynamic>{'ticket': 'tk_1', 'expires_at': 999}),
+        (RequestOptions options) => _json(
+          <String, dynamic>{'ticket': 'tk_1', 'expires_at': futureExpiry},
+        ),
       );
       final result = await api.prepareAuth(
         baseUrl: 'http://localhost:8080',
@@ -262,7 +268,9 @@ void main() {
       expect(result.mode, WebViewAuthMode.ticket);
       expect(result.ready, isTrue);
       expect(result.url, contains('#ticket=tk_1'));
-      expect(result.expiresAt, 999);
+      expect(result.expiresAt, futureExpiry);
+      // 首发即可用 → 不应发生任何重签
+      expect(result.ticketRenewCount, 0);
     });
 
     test('ticket 端点 404 → 静默降级到方案 B（不抛给 UI）', () async {

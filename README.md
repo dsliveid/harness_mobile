@@ -173,6 +173,51 @@ F:\Software\flutter\bin\flutter.bat test                                    # �
 
 > ⚠️ Flutter 未加入 PATH 时用绝对路径；若在 PowerShell 用管道接 `Select-Object` 会让退出码失真，请重定向日志读取。
 
+#### 一键脚本（推荐，替代上面的手敲命令）
+
+根目录提供 `run.sh` / `build.sh`（Git Bash）与 `run.cmd` / `build.cmd`（双击/CMD）：
+
+```bash
+./run.sh                                  # 默认 flutter run -d windows（Windows 桌面调试）
+./run.sh --server-url http://127.0.0.1:5611   # 顺带注入服务端地址，免手填
+./run.sh --android --adb-reverse          # 真机 USB：自动 adb reverse 5611 + 跑第一个在线设备
+./build.sh                                # 默认 = --target device（arm64-v8a，单 APK）
+./build.sh --target emulator --debug      # x86_64 APK，装进 AVD（模拟器只认这个）
+./build.sh --windows                      # 打 Windows 桌面版（产物是整个目录）
+./run.sh --help                           # 全部参数
+```
+
+Windows 用户直接 `run.cmd` / `build.cmd`，无需先开 Git Bash（脚本会自动找 bash）。
+
+> 设计要点：脚本用 `exec` 把控制台交给 flutter，所以 `r`/`R`/`q` 热重载交互全部照常可用。
+> `--server-url` 只影响**本次运行**，不会覆盖你在 App 里已保存的地址。
+
+#### 双轨 ABI：模拟器包与真机包不能互装
+
+`build.sh` 用 `--target` 三档控制目标 ABI（缺省 `device`）：
+
+| 档位 | 注入参数 | 用途 |
+| --- | --- | --- |
+| `emulator` | `--target-platform android-x64` | x86_64 AVD（本机 `harness_test`） |
+| `device` | `--target-platform android-arm64` | arm64-v8a 真机（默认） |
+| `all` | 不带 `--target-platform` | 全 ABI，**最慢**（要 3 份引擎 jar，各 100MB+） |
+
+必守规则：
+
+- **不能互装**：x86_64 APK 装真机会报 `INSTALL_FAILED_NO_MATCHING_ABIS`，反之亦然。
+- **不能外推**：在 x86_64 模拟器上验证通过的架构相关行为，**不得**直接认定 arm64 真机同样成立（原生库实现可能不同）。
+- 显式指定单 ABI 不是洁癖：不指定时 Flutter 会为每个 ABI 拉一份引擎 jar，首次构建看起来像卡死十几分钟。
+
+#### 构建前置自检
+
+`build.sh` 在动工前会自检三项，缺项**快速失败并给修复命令**（`--skip-preflight` 可跳过，不推荐）：
+
+1. **nuget 可见性**（仅 Windows 桌面构建）— 且会区分「没装」与「装了但当前终端 PATH 没刷新」。
+2. **MSVC v143 工具集**（仅 Windows 桌面构建）— 校验 `windows/CMakeLists.txt` 里的注入是否存在且位于 `project()` **之前**，并检查 14.3x 工具集文件真装了。
+3. **Gradle 代理一致性**— 设了 `HTTP_PROXY` 就必须在 `android/gradle.properties` 里同时配 `-Dhttp.proxyHost/Port`，否则 Gradle 下载恒 0 字节（看起来像卡死）。
+
+`--dry-run` 会打印完整命令与**目标 ABI**，可先核对再真跑。
+
 ### 4.3 连接本地服务端跑通全链
 
 前置：`harness_go` 服务端已启动（默认 `http://127.0.0.1:5611`）。

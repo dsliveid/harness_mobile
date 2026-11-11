@@ -51,3 +51,36 @@ String _buildBase(Uri uri, String path) {
 
 /// baseUrl 是否可用于发起请求（非空且 scheme/host 合法）。
 bool isUsableBaseUrl(String baseUrl) => normalizeBaseUrl(baseUrl).isNotEmpty;
+
+// ---------------------------------------------------------------------------
+// 编译期注入（调试提速）
+// ---------------------------------------------------------------------------
+//
+// 为什么需要：`flutter run` 时每次都要在 App 里手填服务端地址（Windows 桌面端
+// 尤其烦：窗口重建即重填一遍）。脚本侧 `--server-url` 通过 `--dart-define=BASE_URL=...`
+// 传进来，启动即生效。
+//
+// ⚠️ 未注入时 `kInjectedBaseUrl` 是空串，[resolveStartupBaseUrl] 会原样回落到本地
+// 存储值，行为与加这个特性之前**逐字节一致**，不影响任何既有调用方与测试。
+
+/// 编译期注入的服务端地址（`flutter run --dart-define=BASE_URL=http://...`）。
+///
+/// 空串 = 未注入（正常发布包的默认形态）。
+const String kInjectedBaseUrl = String.fromEnvironment('BASE_URL');
+
+/// 解析「本次启动生效」的 baseUrl：**注入值优先于本地存储值**。
+///
+/// 语义边界（刻意如此）：注入值只影响运行期视图，**不写回存储**。
+/// 否则用 `--server-url` 调试一次就会永久污染用户的配置，之后在设置页改了地址
+/// 会「改了不生效」，排查成本极高。调试注入应当是「本次运行覆盖」。
+///
+/// 注入值也走 [normalizeBaseUrl] 归一化；非法注入（如 `ftp://x`、空 host）会被
+/// 归一化成空串，从而自然回落到本地存储值——不会让一个坏参数把 App 卡在 setup 页。
+String resolveStartupBaseUrl({
+  required String saved,
+  required String injected,
+}) {
+  final fromBuild = normalizeBaseUrl(injected);
+  if (fromBuild.isNotEmpty) return fromBuild;
+  return normalizeBaseUrl(saved);
+}

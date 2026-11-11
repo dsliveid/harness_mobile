@@ -211,8 +211,123 @@ class DeviceWsClient {
     _retryTimer?.cancel();
     _retryTimer = null;
     _retryCount = 0;
+    _suspended = false; // 用户主动停止后，下次回前台不该自动复活
     _teardown();
     _setState(DeviceWsState.disconnected);
+  }
+
+  // ============ M4：前后台切换（resync） ============
+
+  /// App 切后台时挂起连接的标记。
+  ///
+  /// 为什么要挂起而不是「什么都不做」：进后台后心跳定时器仍会跑（Android 上
+  /// 会被系统冻结在半死状态），回前台时那条 TCP 早已被 NAT/系统回收，
+  /// 而状态机还自认为 `live` —— UI 于是显示「已连接」却收不到任何帧。
+  bool _suspended = false;
+
+  /// 是否已被后台挂起（供 UI / 测试观测）。
+  bool get suspended => _suspended;
+
+  /// resync 进行中标记（幂等护栏）。
+  ///
+  /// 回前台可能连续触发多个 lifecycle 事件（inactive → resumed 抖动、
+  /// 快速切前后台），没有这个标记就会并发发起多个建连，形成连接风暴。
+  bool _resyncInFlight = false;
+
+  /// resync 是否正在执行（供测试观测幂等性）。
+  bool get resyncInFlight => _resyncInFlight;
+
+  /// 本次 resync 累计执行次数（观测用：突增说明前后台事件在抖动）。
+  int _resyncCount = 0;
+
+  int get resyncCount => _resyncCount;
+
+  /// 切后台：挂起连接，停掉重连退避与心跳。
+  ///
+  /// - 保留 [DeviceWsState.dead] 语义（dead 时本来就不该有任何动作）；
+  /// - 主动断开而不是「留着半死连接」：回前台时重建一条干净的连接，
+  ///   比复用一条可能已被系统回收的连接更可靠；
+  /// - 不重置 [_retryCount]：后台期间不该悄悄洗掉退避预算，否则
+  ///   「一直连不上」的设备会被无限重试拖电。
+  Future<void> suspendForBackground() async {
+    if (_disposed || _suspended) return;
+    if (_state == DeviceWsState.dead) {
+      // dead 是终态：等用户手动重连，后台切换不该偷偷复活它。
+      _suspended = true;
+      return;
+    }
+    _suspended = true;
+    _gen++; // 作废本代所有迟到回调
+    _retryTimer?.cancel();
+    _retryTimer = null;
+    _teardown();
+    _setState(DeviceWsState.disconnected);
+    _log('App 进入后台，长连接已挂起');
+  }
+
+  /// 回前台：恢复连接（幂等）。
+  ///
+  /// 返回值表示**是否真的发起了网络动作**（测试据此断言幂等：
+  /// 连续两次 resumed 只应产生一次建连）。
+  Future<bool> resumeFromBackground() async {
+    if (_disposed) return false;
+    final wasSuspended = _suspended;
+    _suspended = false;
+    // dead 不自动复活：`device.revoked` / `replaced_elsewhere` 等需要用户
+    // 明确动作（清令牌 / 换设备），后台切换不是这类授权信号。
+    if (_state == DeviceWsState.dead) return false;
+    if (!wasSuspended &&
+        (_state == DeviceWsState.connecting ||
+            _state == DeviceWsState.handshaking ||
+            _state == DeviceWsState.live)) {
+      // 没被挂起且连接健康：只做状态重拉，不重建连接。
+      return _resyncState();
+    }
+    return resyncNow();
+  }
+
+  /// 立即 resync：必要时重连 + 触发上层状态重拉（幂等）。
+  ///
+  /// 幂等三层保护：
+  /// 1. [_resyncInFlight]：并发调用直接返回 false（不排队、不叠加）；
+  /// 2. 状态判据：`connecting`/`handshaking`/`live` 不重建连接；
+  /// 3. dead 不自动复活（见 [resumeFromBackground]）。
+  Future<bool> resyncNow() async {
+    if (_disposed || _resyncInFlight) return false;
+    _resyncInFlight = true;
+    _resyncCount++;
+    try {
+      final health = _state;
+      if (health == DeviceWsState.dead) return false;
+      if (health == DeviceWsState.connecting ||
+          health == DeviceWsState.handshaking ||
+          health == DeviceWsState.live) {
+        return await _resyncState();
+      }
+      // disconnected / reconnecting：放弃退避等待，立刻重连。
+      _retryTimer?.cancel();
+      _retryTimer = null;
+      _retryCount = 0;
+      _log('resync：立即重建连接');
+      await _attempt();
+      return true;
+    } finally {
+      _resyncInFlight = false;
+    }
+  }
+
+  /// 状态重拉：在**已有活连接**上主动发一次 ping，逼服务端回 pong/最新状态。
+  ///
+  /// 为什么用 ping 而不是新造一条连接：连接本身健康时重建只会让 UI 闪一下
+  /// 「连接中」并丢掉在途帧；发一次 ping 就能让服务端把最新 `load` /
+  /// pending 状态带回来，成本最低。
+  Future<bool> _resyncState() async {
+    if (_state != DeviceWsState.live && _state != DeviceWsState.handshaking) {
+      return false;
+    }
+    _sendPing();
+    _log('resync：已请求服务端同步最新状态');
+    return true;
   }
 
   /// 释放资源（之后不可再用）。

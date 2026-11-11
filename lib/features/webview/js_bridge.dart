@@ -93,23 +93,89 @@ $caps
 ''';
 }
 
-/// 解析页面下发的深链。
+/// 深链被拒的**具体原因**（M2：拒绝必须可解释，不许静默吞掉）。
+///
+/// 为什么要枚举而不是直接返回 null：白名单拒绝是**用户可见**的行为
+/// （推送点开会话但链接写错、Web 端版本比端侧新多发了新类型深链），
+/// 只返回 null 会让调用方只能给一句含糊的「已忽略」，用户完全无法自救。
+enum DeepLinkRejection {
+  /// 空串 / 纯空白。
+  empty('意图为空'),
+
+  /// 不是合法 URI。
+  malformed('链接格式非法'),
+
+  /// scheme 不是 `harness`。
+  wrongScheme('协议不受支持'),
+
+  /// `harness://` 后的类型不在白名单（含已删除的 `approval`）。
+  unknownHost('意图类型不在白名单'),
+
+  /// `harness://session` 缺少会话 id。
+  missingId('会话意图缺少会话 id');
+
+  const DeepLinkRejection(this.reason);
+
+  /// 可读原因（直接拼进用户提示，不含任何敏感信息）。
+  final String reason;
+}
+
+/// 深链解析结论：**要么**给出意图，**要么**给出拒绝原因。
+///
+/// 二者必居其一（`accepted == (intent != null)`），杜绝「返回 null 但有意图」
+/// 这种中间态 —— 那种状态是静默吞链的温床。
+class DeepLinkDecision {
+  /// 命中白名单。
+  const DeepLinkDecision.accepted(DeepLinkIntent this.intent) : rejection = null;
+
+  /// 被白名单显式拒绝。
+  const DeepLinkDecision.rejected(DeepLinkRejection this.rejection)
+      : intent = null;
+
+  /// 解析出的意图（被拒时为 null）。
+  final DeepLinkIntent? intent;
+
+  /// 拒绝原因（命中时为 null）。
+  final DeepLinkRejection? rejection;
+
+  bool get accepted => intent != null;
+
+  /// 拒绝时的用户可见文案（命中白名单时为空串）。
+  ///
+  /// 措辞固定为「已拒绝」而不是「已忽略」：忽略暗示端侧可能没收到，
+  /// 拒绝是明确表态，配合原因用户/开发者都能据此排查。
+  String get rejectMessage =>
+      rejected ? '无法识别的页面意图（${rejection!.reason}），已拒绝' : '';
+
+  /// 是否被拒（与 [accepted] 互补，读代码时更直观）。
+  bool get rejected => !accepted;
+}
+
+/// 解析页面下发的深链（**带拒绝原因**的完整版）。
 ///
 /// 只接受两种形态：
 /// - `harness://session/<id>`
 /// - `harness://reauth`
 ///
 /// 其余（含 `https://`、`harness://approval/...`、未知类型、session 缺 id）
-/// 一律返回 null —— 白名单机制，避免页面用任意 URL 诱导端侧行为。
-DeepLinkIntent? parseDeepLink(String url) {
+/// 一律 [DeepLinkDecision.rejected] —— 白名单机制，避免页面用任意 URL
+/// 诱导端侧行为。调用方必须把 [DeepLinkDecision.rejectMessage] 呈现给用户。
+DeepLinkDecision resolveDeepLink(String url) {
   final text = url.trim();
-  if (text.isEmpty) return null;
+  if (text.isEmpty) {
+    return const DeepLinkDecision.rejected(DeepLinkRejection.empty);
+  }
 
   final uri = Uri.tryParse(text);
-  if (uri == null) return null;
-  if (uri.scheme.toLowerCase() != kDeepLinkScheme) return null;
+  if (uri == null) {
+    return const DeepLinkDecision.rejected(DeepLinkRejection.malformed);
+  }
+  if (uri.scheme.toLowerCase() != kDeepLinkScheme) {
+    return const DeepLinkDecision.rejected(DeepLinkRejection.wrongScheme);
+  }
 
-  // 必须写成 `harness://<type>`；`harness:<type>` 这种简写不接受。
+  // 必须写成 `harness://<type>`；`harness:<type>` 这种简写不接受
+  //（简写时 host 为空，落到 default 分支被拒）。
   final host = uri.host.toLowerCase();
   final DeepLinkKind kind;
   switch (host) {
@@ -118,19 +184,33 @@ DeepLinkIntent? parseDeepLink(String url) {
     case 'reauth':
       kind = DeepLinkKind.reauth;
     default:
-      return null;
+      return const DeepLinkDecision.rejected(DeepLinkRejection.unknownHost);
   }
 
   if (kind == DeepLinkKind.reauth) {
-    return DeepLinkIntent(kind: kind, id: '', rawUrl: text);
+    return DeepLinkDecision.accepted(
+      DeepLinkIntent(kind: kind, id: '', rawUrl: text),
+    );
   }
 
-  if (uri.pathSegments.isEmpty) return null;
+  if (uri.pathSegments.isEmpty) {
+    return const DeepLinkDecision.rejected(DeepLinkRejection.missingId);
+  }
   final id = uri.pathSegments.first.trim();
-  if (id.isEmpty) return null;
+  if (id.isEmpty) {
+    return const DeepLinkDecision.rejected(DeepLinkRejection.missingId);
+  }
 
-  return DeepLinkIntent(kind: kind, id: id, rawUrl: text);
+  return DeepLinkDecision.accepted(
+    DeepLinkIntent(kind: kind, id: id, rawUrl: text),
+  );
 }
+
+/// 解析页面下发的深链（只要意图的简版，内部委托 [resolveDeepLink]）。
+///
+/// 保留此函数是为了既有调用点/测试的语义不变：**null 依然代表拒绝**。
+/// 新增代码请优先用 [resolveDeepLink]，以便把拒绝原因呈现给用户。
+DeepLinkIntent? parseDeepLink(String url) => resolveDeepLink(url).intent;
 
 /// JS 对象键：只允许标识符字符，其余直接丢弃（防注入）。
 String _jsKey(String raw) {

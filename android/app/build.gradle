@@ -7,9 +7,15 @@ plugins {
 
 android {
     namespace = "com.harness.harness_mobile"
-    // 显式指定 35：flutter_plugin_android_lifecycle 与 sqlite3_flutter_libs
-    // 都要求 compileSdk >= 35（向后兼容，不影响 minSdk 的旧设备）
-    compileSdk = 35
+    // 🔴 compileSdk 必须为 36（2026-11 Android 构建实测）：
+    //   androidx.activity:activity:1.13.0 要求使用方 compileSdk >= 36，
+    //   否则 :app:checkDebugAarMetadata 直接失败：
+    //     "Dependency 'androidx.activity:activity:1.13.0' requires libraries and
+    //      applications that depend on it to compile against version 36 or later
+    //      of the Android APIs. :app is currently compiled against android-35."
+    //   Flutter 3.47.9 的 Android toolchain 也要求 SDK 36（doctor 已校验）。
+    //   前置条件：sdkmanager 需装 platforms;android-36 与 build-tools;36.0.0。
+    compileSdk = 36
     // 🔴 ndkVersion 已移除（2026-11，首次 Android 构建实测）：
     //   原为 `ndkVersion = flutter.ndkVersion`，会强制 sdkmanager 安装 NDK 28.2.13676358。
     //   批次 C 注销本地执行、且已移除 sqlite3_flutter_libs 后，本项目**无任何原生 C/C++ 源码**，
@@ -23,6 +29,16 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // 🔴 必须启用 core library desugaring（2026-11 Android 构建实测）：
+        //   flutter_local_notifications 依赖 java.time 等 Java 8+ API，未启用时
+        //   :app:checkDebugAarMetadata 失败：
+        //     "Dependency ':flutter_local_notifications' requires core library
+        //      desugaring to be enabled for :app."
+        //   配套依赖见文件末尾 dependencies { coreLibraryDesugaring ... }。
+        //   ⚠️ 属性名必须用 coreLibraryDesugaringEnabled（AGP 8.x 的
+        //      CompileOptions 未提供 isCoreLibraryDesugaringEnabled 的 setter，
+        //      写错会报 "Could not set unknown property"）。
+        coreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -51,4 +67,12 @@ android {
 
 flutter {
     source = "../.."
+}
+
+// 🔴 core library desugaring 配套依赖（2026-11 Android 构建实测）：
+//   与 android.compileOptions.isCoreLibraryDesugaringEnabled = true 成对出现，
+//   缺一不可（只开开关不引依赖会在编译期报 desugar_jdk_libs 找不到）。
+//   flutter_local_notifications 需要它来在低 API 设备上提供 java.time / java.util.stream 等。
+dependencies {
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'
 }

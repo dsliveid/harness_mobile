@@ -1,5 +1,20 @@
 # Project-level configuration.
 cmake_minimum_required(VERSION 3.14)
+
+# 🔴 MSVC 工具集锁定为 v143（2026-11，Windows 构建实测）：
+#   本机 VS 为 2026 Insiders（MSVC 14.51 为默认工具集）。14.51 的
+#   <experimental/coroutine> 用 static_assert 把旧式 /await 协程从"警告"升级为
+#   硬错误（error C2338: STL1011），导致 flutter_inappwebview_windows 0.6.0 无法编译：
+#     VC/Tools/MSVC/14.51.x/include/experimental/coroutine(37,1): error C2338 ...
+#   Flutter 的 build_windows.dart 把 CMake 参数写死（-G/-A，**不传 -T**），
+#   所以只能在工程侧锁定工具集：给 cmake_minimum_required 之后的 project() 前置
+#   CMAKE_GENERATOR_TOOLSET 缓存变量。v143（14.39.33519）的该头文件无此断言。
+#   前置条件：VS 需装 "MSVC v143 - VS 2022 C++ x64/x86 生成工具" 组件。
+#   若将来插件升级到兼容新版 MSVC 的版本，可移除本段恢复默认工具集。
+if(NOT DEFINED CMAKE_GENERATOR_TOOLSET OR CMAKE_GENERATOR_TOOLSET STREQUAL "")
+  set(CMAKE_GENERATOR_TOOLSET "v143" CACHE STRING "MSVC toolset (pin to avoid /await hard error)" FORCE)
+endif()
+
 project(harness_mobile LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change

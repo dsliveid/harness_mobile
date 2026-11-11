@@ -107,6 +107,20 @@ CLEARTEXT communication to 192.168.1.10 not permitted by network security policy
 
 ## 3. 三种运行方式（按场景选）
 
+> 💡 **先看这个**：本仓根目录已有 `run.sh` / `build.sh`（Git Bash）与 `run.cmd` / `build.cmd`
+> （Windows 双击/CMD），把下面所有手敲命令都封装好了。日常开发建议直接用脚本：
+>
+> ```powershell
+> .\run.cmd                                    # 默认 Windows 桌面调试（团队默认）
+> .\run.cmd --android --adb-reverse            # 真机 USB：自动 adb reverse + 跑第一个在线设备
+> .\run.cmd --server-url http://10.0.2.2:5611  # 模拟器：地址免手填
+> .\run.cmd --emulator <id>                    # 先起模拟器再跑
+> .\build.cmd                                  # 默认打包单 APK（release）
+> .\run.cmd --help                             # 全部参数
+> ```
+>
+> 下面是各方式的**等价手敲命令**，用于理解脚本到底做了什么，或脚本不可用时兜底。
+
 ### 方式 A：模拟器（日常开发首选）
 
 ```powershell

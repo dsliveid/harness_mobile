@@ -120,9 +120,15 @@ class AppSession extends ChangeNotifier {
       );
 
   /// 从本地存储装配（启动时调用一次）。
+  ///
+  /// baseUrl 走 [resolveStartupBaseUrl]：`--dart-define=BASE_URL=...` 注入值优先于
+  /// 本地存储值（脚本 `run.sh --server-url` 的落地链路）。未注入时行为与旧版一致。
   Future<void> load() async {
     final saved = await _settings.load();
-    _baseUrl = normalizeBaseUrl(saved.baseUrl);
+    _baseUrl = resolveStartupBaseUrl(
+      saved: saved.baseUrl,
+      injected: kInjectedBaseUrl,
+    );
     _deviceId = saved.deviceId;
     _deviceName = saved.deviceName;
     _signedIn = await _tokens.hasUserToken();

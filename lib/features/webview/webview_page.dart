@@ -262,6 +262,7 @@ class WebViewPage extends ConsumerStatefulWidget {
     this.webViewFactory,
     this.appVersion = '0.1.0',
     this.onDeepLink,
+    this.onDeepLinkRejected,
   });
 
   /// 测试注入点；为空时使用 [defaultWebViewFactory]。
@@ -272,6 +273,12 @@ class WebViewPage extends ConsumerStatefulWidget {
 
   /// 深链处理钩子；为空时走内置默认行为（会话直接跳原生页）。
   final void Function(DeepLinkIntent intent)? onDeepLink;
+
+  /// 深链被白名单拒绝时的回调（M2：拒绝必须可观测，不许静默吞掉）。
+  ///
+  /// 与 [onDeepLink] 对称存在：两者覆盖 `resolveDeepLink` 的**全部**分支，
+  /// 调用方（含测试）可以据此断言「每一条下发的深链都有确定性归属」。
+  final void Function(DeepLinkRejection rejection)? onDeepLinkRejected;
 
   @override
   ConsumerState<WebViewPage> createState() => _WebViewPageState();
@@ -311,6 +318,10 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
 
   /// 当前错误是否属于「拿不到凭据」的 fail-closed 分支（决定是否提示回账号页）。
   bool _authBlocked = false;
+
+  /// 凭据链路的**结构化失败原因**（M3）：非空时错误 UI 才能给出精准提示与
+  /// 「重试票据申请」动作，而不是只丢一句笼统文案。
+  WebViewAuthFailure? _authFailure;
 
   bool _loading = true;
 
@@ -422,6 +433,11 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
         // 重新登录并无意义，多给一个错误动作只会让用户更困惑。
         onOpenAccount:
             _authBlocked ? () => context.push(AppRoutes.account) : null,
+        authFailure: _authFailure,
+        // M3：票据类失败额外给「重试票据申请」，一键重签而不必重走全链路。
+        onRetryTicket: _authBlocked && _authFailure != null
+            ? () => _reload(null)
+            : null,
       );
     }
     if (view == null) {
@@ -464,6 +480,7 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
       _loading = true;
       _error = null;
       _authBlocked = false;
+      _authFailure = null;
     });
   }
 
@@ -496,17 +513,22 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
     // 或代次已被「重试 / 重新加锁 / 地址变更」推进（旧结果必须丢弃）。
     if (!mounted || generation != _generation) return;
 
-    final entry = auth == null ? null : Uri.tryParse(auth.url);
+    final entry = auth.ready ? Uri.tryParse(auth.url) : null;
     if (entry == null) {
       // fail-closed：**绝不**退回 `webEntryUri(baseUrl)` 裸地址放行。
+      // M3：错误文案必须**带具体原因**（票据过期 / 签发失败 / Cookie 不可用），
+      // 并在前缀保留统一抬头，让用户一眼知道问题类别 + 下一步动作。
+      final reason = auth.failureMessage;
       setState(() {
         _webView = null;
         _loading = false;
         _authBlocked = true;
-        _error = kWebViewAuthFailedMessage;
+        _error = '$kWebViewAuthFailedMessage\n原因：$reason';
+        _authFailure = auth.failure;
       });
       return;
     }
+    setState(() => _authFailure = null);
 
     final factory = widget.webViewFactory ?? defaultWebViewFactory();
     try {
@@ -557,34 +579,51 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
     }
   }
 
-  /// 首帧认证：一次性 ticket 优先，失败降级 Cookie 注入；两条都不行返回 null。
+  /// 首帧认证：一次性 ticket 优先（过期自动重签），失败降级 Cookie 注入。
   ///
-  /// 返回 null 是**唯一**的失败信号，调用方据此 fail-closed。
+  /// M3 起**永不返回 null**：失败时返回 `mode == none` 且带
+  /// [WebViewAuthFailure] 的结果，调用方据此展示可读文案（而不是白屏）。
+  /// 返回 null 会让「失败原因」在函数边界上丢失，那正是静默白屏的成因。
+  ///
   /// 注意：这里用 `ref.read` 而不是 [servicesOf]（后者内部 `watch`），
   /// 因为本方法在帧后的异步上下文里执行，`watch` 只允许在 build 中使用。
-  Future<WebViewAuthResult?> _prepareAuth(String baseUrl) async {
+  Future<WebViewAuthResult> _prepareAuth(String baseUrl) async {
     final entry = webEntryUri(baseUrl);
-    if (entry == null) return null;
-
     final services = _servicesFor(baseUrl);
     final sink = ref.read(webViewCookieSinkProvider);
     final deviceId = ref.read(appSessionProvider).deviceId;
 
-    if (services != null) {
-      try {
-        final result = await services.webviewTicket.prepareAuth(
-          baseUrl: baseUrl,
-          entryUrl: entry.toString(),
-          deviceId: deviceId,
-          cookieSink: sink,
-        );
-        if (result.ready) return result;
-      } on Object {
-        // prepareAuth 内部已对 ticket / Cookie 逐级降级，这里只兜极端异常。
-        // 兜底同样是 fail-closed：不返回结果 → 调用方展示错误态。
-      }
+    if (entry == null) {
+      return const WebViewAuthResult(
+        mode: WebViewAuthMode.none,
+        url: '',
+        failure: WebViewAuthFailure.ticketIssueFailed,
+      );
     }
-    return null;
+    if (services == null) {
+      return WebViewAuthResult(
+        mode: WebViewAuthMode.none,
+        url: entry.toString(),
+        failure: WebViewAuthFailure.ticketIssueFailed,
+      );
+    }
+
+    try {
+      return await services.webviewTicket.prepareAuth(
+        baseUrl: baseUrl,
+        entryUrl: entry.toString(),
+        deviceId: deviceId,
+        cookieSink: sink,
+      );
+    } on Object {
+      // prepareAuth 内部已对 ticket / Cookie 逐级降级，这里只兜极端异常。
+      // 兜底同样是 fail-closed，但**必须带原因**，否则用户又看到白屏。
+      return WebViewAuthResult(
+        mode: WebViewAuthMode.none,
+        url: entry.toString(),
+        failure: WebViewAuthFailure.ticketIssueFailed,
+      );
+    }
   }
 
   /// 取 baseUrl 绑定的 API 集合（异步上下文版，等价于 [servicesOf] 但用 read）。
@@ -594,16 +633,30 @@ class _WebViewPageState extends ConsumerState<WebViewPage> {
   }
 
   /// 返回 false 表示拦截该导航（不加载）。
+  ///
+  /// M2 铁律：未知深链**必须显式拒绝并给出可见反馈**，绝不静默吞掉。
+  /// 拒绝路径走 [resolveDeepLink] 拿到的 [DeepLinkDecision.rejectMessage]，
+  /// 用户能看到「为什么没反应」而不是以为 App 卡死了。
   bool _handleNavigation(Uri uri) {
     if (uri.scheme != kDeepLinkScheme) return true;
 
-    final intent = parseDeepLink(uri.toString());
+    final decision = resolveDeepLink(uri.toString());
+    final intent = decision.intent;
     if (intent == null) {
-      _toast('无法识别的页面意图，已忽略');
+      _rejectDeepLink(decision, uri);
       return false;
     }
     _dispatchDeepLink(intent);
     return false;
+  }
+
+  /// 显式拒绝未知 / 非法深链：可见提示 + 可选回调 + 记录（不含敏感信息）。
+  void _rejectDeepLink(DeepLinkDecision decision, Uri uri) {
+    final rejection = decision.rejection ?? DeepLinkRejection.unknownHost;
+    // 只记录 scheme/host（可能被构造成恶意串，不落完整 URL 到日志）。
+    debugPrint('深链被拒绝 reason=${rejection.name} host=${uri.host}');
+    widget.onDeepLinkRejected?.call(rejection);
+    _toast(decision.rejectMessage);
   }
 
   /// 深链派发（批次 C：白名单只剩 `session` / `reauth` 两类）。
@@ -749,6 +802,8 @@ class _ErrorState extends StatelessWidget {
     required this.onRetry,
     required this.onOpenSetup,
     this.onOpenAccount,
+    this.authFailure,
+    this.onRetryTicket,
   });
 
   final String message;
@@ -760,6 +815,15 @@ class _ErrorState extends StatelessWidget {
   /// 只用于**凭据不可用**的 fail-closed 分支：Web UI 没有登录表单，
   /// 拿不到 ticket/Cookie 时用户唯一能自救的动作就是回原生重新登录。
   final VoidCallback? onOpenAccount;
+
+  /// 凭据链路的结构化失败原因（M3）：用于把提示语精准化。
+  final WebViewAuthFailure? authFailure;
+
+  /// 非空时展示「重试票据申请」按钮（M3：过期票必须能一键重签）。
+  ///
+  /// 与 [onRetry] 的区别：[onRetry] 走完整的「认证 + 建视图」链路，
+  /// 本按钮只在**票据类**失败时出现，语义更明确（用户能看懂自己在重试什么）。
+  final VoidCallback? onRetryTicket;
 
   @override
   Widget build(BuildContext context) {
@@ -801,6 +865,12 @@ class _ErrorState extends StatelessWidget {
                   icon: const Icon(Icons.refresh),
                   label: const Text('重试'),
                 ),
+                if (onRetryTicket != null)
+                  FilledButton.tonalIcon(
+                    onPressed: onRetryTicket,
+                    icon: const Icon(Icons.vpn_key_outlined),
+                    label: const Text('重试票据申请'),
+                  ),
                 OutlinedButton.icon(
                   onPressed: onOpenSetup,
                   icon: const Icon(Icons.settings_outlined),

@@ -39,12 +39,38 @@ enum WebViewAuthMode {
   cookie,
 }
 
+/// 票据链路最终失败的**可解释原因**（M3：失败必须能变成用户读得懂的话）。
+///
+/// 为什么需要它：`prepareAuth` 返回 `none` 时调用方只知道「拿不到凭据」，
+/// 无法区分「服务端没实现 ticket 端点」与「票过期且重签失败」，
+/// 于是只能给一句笼统文案，用户不知道该重试还是该重新登录。
+enum WebViewAuthFailure {
+  /// 没有可用的设备身份（会退化为「回配对/登录」）。
+  noDeviceId('设备身份缺失，请回配对页重新配对'),
+
+  /// 首次签发的 ticket 在拼接前就已过期，且**重签预算已耗尽**。
+  ticketExpired('一次性票据已过期且重签失败，请重试或回账号页重新登录'),
+
+  /// 票据端点调用失败（网络 / 401 / 404），且没有可用的 Cookie 降级。
+  ticketIssueFailed('无法获取登录凭据（票据签发失败），请检查网络或回账号页重新登录'),
+
+  /// Cookie 降级路径也不可用。
+  cookieUnavailable('无法把登录凭据写入内置页面，请回账号页重新登录');
+
+  const WebViewAuthFailure(this.message);
+
+  /// 用户可读文案（不含任何凭据 / 服务端内部细节）。
+  final String message;
+}
+
 /// 透传结果：给调用方决定加载哪个 URL。
 class WebViewAuthResult {
   const WebViewAuthResult({
     required this.mode,
     required this.url,
     this.expiresAt,
+    this.failure,
+    this.ticketRenewCount = 0,
   });
 
   final WebViewAuthMode mode;
@@ -55,10 +81,23 @@ class WebViewAuthResult {
   /// ticket 过期时刻（服务端 `expires_at`，毫秒时间戳；方案 B/none 为 null）。
   final int? expiresAt;
 
+  /// 失败原因（仅 [WebViewAuthMode.none] 时非空；成功路径必须为 null，
+  /// 否则调用方无法区分「成功」与「带着失败原因却仍可用」）。
+  final WebViewAuthFailure? failure;
+
+  /// 本次为拿到**可用** ticket 而额外重签的次数（0 表示首发即成功）。
+  ///
+  /// 观测用：模拟器上若长期 >0，说明 TTL 与冷启动耗时已经打架，需要调 TTL。
+  final int ticketRenewCount;
+
   bool get ready => mode != WebViewAuthMode.none;
 
+  /// 失败时可读文案（成功时为空串，绝不拼出半截提示）。
+  String get failureMessage => ready ? '' : (failure ?? WebViewAuthFailure.ticketIssueFailed).message;
+
   @override
-  String toString() => 'WebViewAuthResult(${mode.name})';
+  String toString() =>
+      'WebViewAuthResult(${mode.name}${failure == null ? '' : ', ${failure!.name}'})';
 }
 
 /// ticket 签发响应（服务端待接线）。
@@ -78,6 +117,18 @@ class WebViewTicket {
   final int? expiresAt;
 
   bool get isEmpty => ticket.isEmpty;
+
+  /// 在 [nowMs]（毫秒时间戳）时刻是否**已过期**。
+  ///
+  /// 为什么要这条判定（M3 根因）：服务端签发的 ticket TTL 很短（默认 120s），
+  /// 从签发到 WebView 真正发起首帧加载之间可能已跨过过期点（弱网、冷启动、
+  /// 锁屏期间被系统挂起）。把**过期票**塞进 URL 不会立刻报错 ——
+  /// 页面能加载出来，但 ticket 兑换失败，Web UI 停在未登录态/空白，
+  /// 用户看到的就是「静默白屏」。端侧必须在拼 URL 之前就判废并重签。
+  ///
+  /// [expiresAt] 为空视为**未知**而非已过期：服务端可能尚未下发该字段，
+  /// 此时按原行为放行（不做无依据的判废），避免把可用链路误判为失效。
+  bool isExpiredAt(int nowMs) => expiresAt != null && expiresAt! <= nowMs;
 
   /// 令牌类字段绝不进日志/文案。
   @override
@@ -175,39 +226,95 @@ class WebViewTicketApi {
   ///
   /// 两条路径都不可用时返回 [WebViewAuthMode.none]，调用方应退回原生登录，
   /// **不得**在 WebView 内弹登录表单（§6.1 决策 2 连带约束）。
+  ///
+  /// M3 加固（消除静默白屏）：
+  /// 1. 签发出**已过期**的 ticket 时**不拼进 URL**，而是立刻重签（最多
+  ///    [maxTicketRenewAttempts] 次）。过期票塞进 URL 不会报错，只会让页面
+  ///    悄悄停在未登录态 —— 那就是白屏的成因。
+  /// 2. 重签预算耗尽仍拿不到可用票 → 先尝试 Cookie 降级；
+  ///    降级也不可用时返回 **带 [WebViewAuthFailure] 的 none**，
+  ///    调用方据此展示「可读文案 + 重试按钮」，而不是空白页。
+  /// 3. [nowMsProvider] 可注入，让「已过期」在测试里可复现（不依赖真实时钟）。
   Future<WebViewAuthResult> prepareAuth({
     required String baseUrl,
     required String entryUrl,
     String? deviceId,
     WebViewCookieSink? cookieSink,
+    int Function()? nowMsProvider,
   }) async {
     final id = deviceId ?? '';
+    final nowMs = nowMsProvider ?? _defaultNowMs;
+    var renewCount = 0;
+    WebViewAuthFailure? failure;
+    var sawExpired = false;
 
     if (id.isNotEmpty) {
-      try {
-        final ticket = await issue(deviceId: id);
-        if (!ticket.isEmpty) {
-          return WebViewAuthResult(
-            mode: WebViewAuthMode.ticket,
-            url: appendTicketFragment(entryUrl, ticket.ticket),
-            expiresAt: ticket.expiresAt,
-          );
+      // 1 + maxTicketRenewAttempts：首发一次，随后在「过期/空票」时重签。
+      for (var attempt = 0; attempt <= maxTicketRenewAttempts; attempt++) {
+        final WebViewTicket ticket;
+        try {
+          ticket = await issue(deviceId: id);
+        } on Object {
+          // 端点未接线（404）/ 401 / 网络异常 → 记录原因后转降级。
+          failure = WebViewAuthFailure.ticketIssueFailed;
+          break;
         }
-      } on Object {
-        // 服务端未接线（404）/ 401 / 网络异常 → 静默降级到方案 B。
+        if (ticket.isEmpty) {
+          failure = WebViewAuthFailure.ticketIssueFailed;
+          break;
+        }
+        if (ticket.isExpiredAt(nowMs())) {
+          // 关键分支：**绝不**把过期票拼进 URL（否则就是静默白屏）。
+          sawExpired = true;
+          failure = WebViewAuthFailure.ticketExpired;
+          if (attempt < maxTicketRenewAttempts) renewCount++;
+          continue; // 进入下一轮重签
+        }
+        return WebViewAuthResult(
+          mode: WebViewAuthMode.ticket,
+          url: appendTicketFragment(entryUrl, ticket.ticket),
+          expiresAt: ticket.expiresAt,
+          ticketRenewCount: renewCount,
+        );
       }
+      if (sawExpired) failure = WebViewAuthFailure.ticketExpired;
+    } else {
+      failure = WebViewAuthFailure.noDeviceId;
     }
 
     if (cookieSink != null) {
       final ok = await injectSessionCookie(sink: cookieSink, baseUrl: baseUrl);
       if (ok) {
-        return WebViewAuthResult(mode: WebViewAuthMode.cookie, url: entryUrl);
+        return WebViewAuthResult(
+          mode: WebViewAuthMode.cookie,
+          url: entryUrl,
+          ticketRenewCount: renewCount,
+        );
       }
+      // 只在**尚无原因**时才写入 cookieUnavailable：票据过期 / 签发失败才是
+      // 根因，Cookie 只是备用路径；用备用路径的失败覆盖根因会让用户
+      // 看到「Cookie 写不进去」这种他根本无法自救的提示。
+      failure ??= WebViewAuthFailure.cookieUnavailable;
     }
 
-    return WebViewAuthResult(mode: WebViewAuthMode.none, url: entryUrl);
+    return WebViewAuthResult(
+      mode: WebViewAuthMode.none,
+      url: entryUrl,
+      failure: failure ?? WebViewAuthFailure.ticketIssueFailed,
+      ticketRenewCount: renewCount,
+    );
   }
+
+  /// 为拿到可用 ticket 允许的额外重签次数（首发之外）。
+  ///
+  /// 取 1 而不是无限重试：过期通常意味着「签发 → 加载」跨了 TTL，
+  /// 再签一次就够；连续过期说明服务端时钟 / TTL 配置已经坏了，
+  /// 无限重试只会变成请求风暴并把用户按在加载态。
+  final int maxTicketRenewAttempts = 1;
 }
+
+/// 默认时钟（毫秒时间戳）。抽成函数便于测试注入 fake 时钟。
+int _defaultNowMs() => DateTime.now().millisecondsSinceEpoch;
 
 /// 服务端会话 Cookie 名（§4.2 草案；与服务端 `Set-Cookie` 对齐）。
 const String kSessionCookieName = 'hg_sess';
