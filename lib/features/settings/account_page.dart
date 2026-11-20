@@ -23,7 +23,6 @@ import '../../core/app/providers.dart';
 import '../../data/remote/auth_api.dart';
 import '../shared/ui_helpers.dart';
 import '../shared/web_entry.dart';
-import 'my_devices_section.dart';
 
 class AccountPage extends ConsumerStatefulWidget {
   const AccountPage({super.key});
@@ -134,12 +133,6 @@ class _AccountPageState extends ConsumerState<AccountPage> {
                   ?.copyWith(color: theme.colorScheme.outline),
             ),
           ),
-          const Divider(height: 28),
-          // 我的设备（实时同步的唯一消费点）：与其他端上下线联动，无需手动刷新。
-          // 刻意放在**危险操作之后**：
-          // ① 危险操作（解绑 / 退出 / 注销）是用户最常见的入口，不能被挤到折叠区；
-          // ② 本区块高度可变（0~N 行）且依赖网络，放在顶部会把下方按钮推走。
-          const MyDevicesSection(),
           const SizedBox(height: 28),
         ],
       ),
