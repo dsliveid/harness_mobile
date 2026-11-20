@@ -21,7 +21,6 @@ library;
 import '../../core/error/app_error.dart';
 import '../../protocol/frame_payloads.dart';
 import '../local/secure_store.dart';
-import '../model/device_state.dart';
 // 复用登录链路的用户视图类型：配对下发的 `user` 与 `/auth/login` 的 `user`
 // 是同一份服务端结构（id/username/display_name/role），刻意不另立类型。
 import 'auth_api.dart' show AuthUser;
@@ -396,18 +395,6 @@ class DeviceApi {
       return false;
     }
   }
-
-  /// 设备列表（含在线状态与能力项）。
-  ///
-  /// 解析成与 SSE 共用的 `DeviceState`（`data/model/device_state.dart`），
-  /// 使「首屏灌入的列表」与「SSE 快照/增量覆盖后的列表」是同一类型。
-  /// 若这里改回 `DeviceInfo`，两条来源会立刻分叉，UI 上表现为
-  /// 「实时同步一次后设备信息字段变少 / 状态错位」。
-  Future<List<DeviceState>> listDevices() => _client.get<List<DeviceState>>(
-        '/api/v1/devices',
-        // 列表端点统一形态是 `{items: [...]}`，故先取 items 再交给共用解析器。
-        parse: (Object? data) => devicesFromJsonList(itemsOf(data)),
-      );
 
   /// 吊销**任意**设备（`DELETE /api/v1/devices/{did}`）。
   ///
