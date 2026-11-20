@@ -21,6 +21,7 @@ library;
 import '../../core/error/app_error.dart';
 import '../../protocol/frame_payloads.dart';
 import '../local/secure_store.dart';
+import '../model/device_state.dart';
 // 复用登录链路的用户视图类型：配对下发的 `user` 与 `/auth/login` 的 `user`
 // 是同一份服务端结构（id/username/display_name/role），刻意不另立类型。
 import 'auth_api.dart' show AuthUser;
@@ -221,64 +222,6 @@ class DeviceSessionOutcome {
   String toString() => 'DeviceSessionOutcome(${status.name})';
 }
 
-/// 设备列表项（服务端 `model.Device`，`model/device.go:47-64`）。
-class DeviceInfo {
-  const DeviceInfo({
-    required this.id,
-    required this.name,
-    required this.kind,
-    required this.platform,
-    required this.status,
-    required this.capabilitiesHash,
-    required this.protocolVersion,
-    required this.appVersion,
-    required this.pairedAt,
-    required this.createdAt,
-    required this.updatedAt,
-    this.lastSeenAt,
-    this.revokedAt,
-    this.capabilities = const <Capability>[],
-  });
-
-  factory DeviceInfo.fromJson(Map<String, dynamic> json) => DeviceInfo(
-        id: _stringOf(json['id']),
-        name: _stringOf(json['name']),
-        kind: _stringOf(json['kind']),
-        platform: _stringOf(json['platform']),
-        status: _stringOf(json['status']),
-        capabilitiesHash: _stringOf(json['capabilities_hash']),
-        protocolVersion: _intOf(json['protocol_version']),
-        appVersion: _stringOf(json['app_version']),
-        pairedAt: _intOf(json['paired_at']),
-        lastSeenAt: _intOrNull(json['last_seen_at']),
-        revokedAt: _intOrNull(json['revoked_at']),
-        createdAt: _intOf(json['created_at']),
-        updatedAt: _intOf(json['updated_at']),
-        capabilities: _capabilitiesOf(json['capabilities']),
-      );
-
-  final String id;
-  final String name;
-  final String kind;
-  final String platform;
-  final String status;
-  final String capabilitiesHash;
-  final int protocolVersion;
-  final String appVersion;
-  final int pairedAt;
-  final int? lastSeenAt;
-  final int? revokedAt;
-  final int createdAt;
-  final int updatedAt;
-  final List<Capability> capabilities;
-
-  bool get isOnline => status == DeviceStatuses.online;
-  bool get isRevoked => status == DeviceStatuses.revoked;
-
-  @override
-  String toString() => 'DeviceInfo($id, $name, $status)';
-}
-
 /// 设备 API。
 class DeviceApi {
   DeviceApi({
@@ -455,11 +398,15 @@ class DeviceApi {
   }
 
   /// 设备列表（含在线状态与能力项）。
-  Future<List<DeviceInfo>> listDevices() => _client.get<List<DeviceInfo>>(
+  ///
+  /// 解析成与 SSE 共用的 `DeviceState`（`data/model/device_state.dart`），
+  /// 使「首屏灌入的列表」与「SSE 快照/增量覆盖后的列表」是同一类型。
+  /// 若这里改回 `DeviceInfo`，两条来源会立刻分叉，UI 上表现为
+  /// 「实时同步一次后设备信息字段变少 / 状态错位」。
+  Future<List<DeviceState>> listDevices() => _client.get<List<DeviceState>>(
         '/api/v1/devices',
-        parse: (Object? data) => itemsOf(data)
-            .map(DeviceInfo.fromJson)
-            .toList(growable: false),
+        // 列表端点统一形态是 `{items: [...]}`，故先取 items 再交给共用解析器。
+        parse: (Object? data) => devicesFromJsonList(itemsOf(data)),
       );
 
   /// 吊销**任意**设备（`DELETE /api/v1/devices/{did}`）。
@@ -554,10 +501,3 @@ int? _intOrNull(Object? value) {
   return null;
 }
 
-List<Capability> _capabilitiesOf(Object? raw) {
-  if (raw is! List) return const <Capability>[];
-  return raw
-      .whereType<Map<String, dynamic>>()
-      .map(Capability.fromJson)
-      .toList(growable: false);
-}

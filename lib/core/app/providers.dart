@@ -15,6 +15,7 @@ import '../../data/ws/device_connection.dart';
 import '../../data/ws/websocket_device_connection.dart';
 import 'api_services.dart';
 import 'app_session.dart';
+import 'device_events_controller.dart';
 import 'device_ws_controller.dart';
 
 /// 安全存储（令牌，红线 R3）。
@@ -104,5 +105,29 @@ final ChangeNotifierProvider<DeviceWsController> deviceWsControllerProvider =
   // `ref.onDispose(controller.dispose)`（会双 dispose 并抛
   // `ChangeNotifier was used after being disposed`）。
   return controller;
+});
+
+/// 设备状态实时同步控制器（App 级单例，SSE）。
+///
+/// ## 与 [deviceWsControllerProvider] 的关系：两条独立连接，互不干扰
+/// - `deviceWsController`：本机 ↔ 服务端的**控制通道**（`/api/v1/devices/ws`，
+///   收发任务/审批帧），生命周期跟「本机是否在线」绑定；
+/// - **本 Provider**：服务端广播的**设备状态镜像**（`/api/v1/devices/events`），
+///   生命周期跟「账号是否登录」绑定。
+///
+/// 两者不可合并：前者是 JSON Lines 双向协议且不免鉴权（设备令牌），
+/// 后者是单向 SSE 且走用户 Bearer（`internal/api/router.go` 的全局中间件）。
+///
+/// ## 边界（勿扩权）
+/// 移动端原生**只**接设备状态流；会话列表流由 WebView 内的 React 自行订阅，
+/// 原因见 `device_events_controller.dart` 文件头（双开同一条流 = 纯堆叠）。
+final ChangeNotifierProvider<DeviceEventsController> deviceEventsControllerProvider =
+    ChangeNotifierProvider<DeviceEventsController>((Ref ref) {
+  final AppSession session = ref.watch(appSessionProvider);
+  return DeviceEventsController(
+    store: ref.watch(secureStoreProvider),
+    // 传取值函数而非快照字符串：用户改服务端地址后，下一次建连自动跟随。
+    baseUrl: () => session.baseUrl,
+  );
 });
 

@@ -130,6 +130,12 @@ class _HarnessMobileAppState extends ConsumerState<HarnessMobileApp> {
         // 失败（未配置/未配对/无 device_token）时静默——那是正常状态，
         // 不是错误；状态机保持 disconnected，UI 展示「未连接」。
         ref.read(deviceWsControllerProvider).start().catchError((Object _) => false);
+        // 设备状态实时同步（SSE）**刻意不在这里启动**：
+        // 门控铁律（docs/protocols.md §4.4 第 1 条）要求「首屏列表落地后才建连」，
+        // 否则首屏结果与快照帧会**交错覆盖**（谁后到谁赢，表现为列表随机闪烁）。
+        // 唯一消费点是账号页的「我的设备」，由它拉完 `GET /devices` 后调
+        // `deviceEventsControllerProvider.markFirstListReady(items)` 开闸 ——
+        // 无消费方就不建连，这也是「不做堆叠」的同一口径。
       });
     });
   }
